@@ -1,85 +1,70 @@
 import asyncio
-import os
-from datetime import datetime
-from solana.rpc.async_api import AsyncClient
+import logging
+import aiohttp
+from utils import execute_buy, send_telegram_message
 
-from utils import (
-    fetch_recent_tokens,
-    is_token_eligible,
-    execute_buy,
-    execute_sell,
-    send_telegram_message,
-)
-from telegram import handle_command
-from copy_trade import run_copy_trader_loop
+# --- Add sniper wallets to watch ---
+WATCHED_WALLETS = [
+    "Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkgS3oG2j7pDn",  # example
+    # Add more sniper wallet addresses here
+]
 
-# --- Configuration ---
-SEEN_TOKENS = set()
-BUY_AMOUNT_SOL = float(os.getenv("BUY_AMOUNT_SOL", 0.1))
-SCAN_INTERVAL = float(os.getenv("SCAN_INTERVAL", 2.5))  # seconds
-AUTO_SELL_MULTIPLIER = float(os.getenv("AUTO_SELL_MULTIPLIER", 2.0))
+# --- Store tokens already seen ---
+wallet_token_cache = {}
 
-def log(msg):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+# --- Monitor tokens and copy trades ---
+async def run_copy_trader_loop(client):
+    """
+    Monitors watched wallets for new token buys and copies the trade.
+    Uses the provided Solana AsyncClient for any on-chain actions.
+    """
+    logging.basicConfig(level=logging.INFO)
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                for wallet in WATCHED_WALLETS:
+                    url = f"https://api.pump.fun/wallet/{wallet}"
+                    try:
+                        async with session.get(url, timeout=10) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                current_mints = {item['mint'] for item in data.get("tokens", [])}
+                                prev_mints = wallet_token_cache.get(wallet, set())
 
-# --- Main sniper loop ---
-async def sniper_loop(client):
-    while True:
-        try:
-            tokens = await fetch_recent_tokens()
-            for token in tokens:
-                mint = token.get("mint")
-                if mint in SEEN_TOKENS:
-                    continue
+                                # Detect new mints
+                                new_tokens = current_mints - prev_mints
+                                if new_tokens:
+                                    for mint in new_tokens:
+                                        await send_telegram_message(f"🧠 Copying sniper: {wallet}\nToken: {mint}")
+                                        try:
+                                            # Example: you can use `client` here for on-chain actions if needed
+                                            # e.g., balance = await client.get_balance(Pubkey.from_string(wallet))
+                                            success, tx = await execute_buy(mint)
+                                            if success:
+                                                await send_telegram_message(f"✅ Copied buy: {mint}\nTx: {tx}")
+                                            else:
+                                                await send_telegram_message(f"❌ Copy failed for {mint}: Unknown error")
+                                        except Exception as e:
+                                            logging.error(f"Copy failed for {mint}: {e}")
+                                            await send_telegram_message(f"❌ Copy failed for {mint}: {e}")
+                                wallet_token_cache[wallet] = current_mints
+                            else:
+                                logging.warning(f"Failed to fetch wallet {wallet}: HTTP {resp.status}")
+                    except Exception as e:
+                        logging.error(f"Error fetching wallet {wallet}: {e}")
+                        await send_telegram_message(f"❌ Error fetching wallet {wallet}: {e}")
+            except Exception as e:
+                logging.error(f"[Copy Trader Error]: {e}")
+                await send_telegram_message(f"❌ Copy trader loop error: {e}")
 
-                SEEN_TOKENS.add(mint)
-                eligible, reason = is_token_eligible(token)
+            await asyncio.sleep(15)  # Check every 15 seconds
 
-                if eligible:
-                    log(f"✅ Eligible token found: {token.get('symbol', 'N/A')} ({mint})")
-                    await send_telegram_message(
-                        f"🎯 *BUY SIGNAL*\nToken: {token.get('symbol', 'N/A')}\nMint: `{mint}`"
-                    )
-                    success, tx = await execute_buy(mint)
-                    if success:
-                        await send_telegram_message(
-                            f"✅ *Buy Executed*\n[View TX](https://solscan.io/tx/{tx})"
-                        )
-
-                        log(f"⏳ Waiting to auto-sell if {AUTO_SELL_MULTIPLIER}x target hit...")
-                        sell_success, sell_tx = await execute_sell(mint, multiplier=AUTO_SELL_MULTIPLIER)
-                        if sell_success:
-                            await send_telegram_message(
-                                f"💸 *Auto-Sold* at {AUTO_SELL_MULTIPLIER}×\n[TX](https://solscan.io/tx/{sell_tx})"
-                            )
-                        else:
-                            await send_telegram_message(
-                                f"⚠️ *Auto-Sell Failed* for `{mint}`"
-                            )
-                    else:
-                        await send_telegram_message(
-                            f"⚠️ *Buy Failed* for {token.get('symbol', 'N/A')}"
-                        )
-                else:
-                    log(f"⏩ Skipped {token.get('symbol', 'N/A')}: {reason}")
-
-        except Exception as e:
-            log(f"❌ Error: {e}")
-            await send_telegram_message(f"❌ *Bot Error:* {e}")
-
-        await asyncio.sleep(SCAN_INTERVAL)
-
-# --- Main entry point ---
-async def main():
-    async with AsyncClient("https://api.mainnet-beta.solana.com") as client:
-        await asyncio.gather(
-            sniper_loop(client),
-            run_copy_trader_loop(client),  # <-- client is now passed here
-            handle_command(client),
-        )
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except Exception as e:
-        log(f"❌ Fatal Error: {e}")
+# If you want to test this script standalone, you can use the following:
+# (Uncomment and adjust as needed)
+#
+# if __name__ == "__main__":
+#     from solana.rpc.async_api import AsyncClient
+#     async def main():
+#         async with AsyncClient("https://api.mainnet-beta.solana.com") as client:
+#             await run_copy_trader_loop(client)
+#     asyncio.run(main())
