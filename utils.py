@@ -69,7 +69,7 @@ def is_token_eligible(token):
         return False, f"Error in filter: {e}"
 
 # --- Execute buy (placeholder) ---
-async def execute_buy(mint):
+async def execute_buy(client, mint):
     try:
         txn = await create_buy_txn(client, keypair, Pubkey.from_string(mint), BUY_AMOUNT_SOL, SLIPPAGE)
         sig = await client.send_raw_transaction(txn.serialize(), opts=TxOpts(skip_preflight=True))
@@ -79,7 +79,7 @@ async def execute_buy(mint):
         return False, None
 
 # --- Execute sell (placeholder) ---
-async def execute_sell(mint, multiplier=2.0):
+async def execute_sell(client, mint, multiplier=2.0):
     try:
         txn = await create_sell_txn(client, keypair, Pubkey.from_string(mint), multiplier)
         sig = await client.send_raw_transaction(txn.serialize(), opts=TxOpts(skip_preflight=True))
@@ -107,22 +107,24 @@ async def send_telegram_message(message):
 
 # --- Main async loop ---
 async def main():
-    global client
-    client = AsyncClient(RPC_URL)
-    tokens = await fetch_recent_tokens()
-    for token in tokens:
-        eligible, reason = is_token_eligible(token)
-        if eligible:
-            print(f"Eligible token: {token['mint']}")
-            await send_telegram_message(f"Eligible token: `{token['mint']}`\nLiquidity: {token.get('liquidity')}\nHolders: {token.get('uniqueHolders')}")
-            # Uncomment below when buy logic is implemented
-            # success, tx_sig = await execute_buy(token['mint'])
-            # if success:
-            #     await send_telegram_message(f"Bought token {token['mint']}! Tx: {tx_sig}")
-        else:
-            print(f"Token {token.get('mint', 'unknown')} not eligible: {reason}")
-    await client.close()
+    async with AsyncClient(RPC_URL) as client:
+        tokens = await fetch_recent_tokens()
+        for token in tokens:
+            eligible, reason = is_token_eligible(token)
+            if eligible:
+                print(f"Eligible token: {token['mint']}")
+                await send_telegram_message(
+                    f"Eligible token: `{token['mint']}`\nLiquidity: {token.get('liquidity')}\nHolders: {token.get('uniqueHolders')}"
+                )
+                # Uncomment below when buy logic is implemented
+                # success, tx_sig = await execute_buy(client, token['mint'])
+                # if success:
+                #     await send_telegram_message(f"Bought token {token['mint']}! Tx: {tx_sig}")
+            else:
+                print(f"Token {token.get('mint', 'unknown')} not eligible: {reason}")
 
 if __name__ == "__main__":
     asyncio.run(main())
 
+Key Improvements
+No use of global client; instead, cli
