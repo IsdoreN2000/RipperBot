@@ -3,7 +3,7 @@ import aiohttp
 import asyncio
 from solders.pubkey import Pubkey
 
-from utils import send_telegram_message, keypair, client
+from utils import send_telegram_message, keypair
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -11,7 +11,7 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 auto_score_enabled = True  # Default: ON
 last_token_info = {}  # For /watch
 
-async def handle_command():
+async def handle_command(client):
     global auto_score_enabled
     last_update_id = None
     while True:
@@ -43,7 +43,7 @@ async def handle_command():
                         elif text == "/latest":
                             await send_telegram_message("🕵️‍♂️ No active tokens in memory yet.")
                         elif text == "/wallet":
-                            await show_wallet_balance()
+                            await show_wallet_balance(client)
                         elif text == "/watch":
                             await show_watched_token()
                         elif text == "/scoremode on":
@@ -58,15 +58,13 @@ async def handle_command():
             print("Telegram error:", e)
         await asyncio.sleep(5)
 
-
-async def show_wallet_balance():
+async def show_wallet_balance(client):
     try:
         sol_balance_resp = await client.get_balance(keypair.pubkey())
         sol = sol_balance_resp.value / 1_000_000_000
         await send_telegram_message(f"💰 Wallet: {sol:.4f} SOL\n🔑 {keypair.pubkey()}")
     except Exception as e:
         await send_telegram_message(f"❌ Failed to fetch balance: {e}")
-
 
 async def show_watched_token():
     if not last_token_info:
@@ -83,7 +81,17 @@ async def show_watched_token():
         )
         await send_telegram_message(msg)
 
+How to Use
+In your main script (e.g., bot.py), create the Solana client and pass it to handle_command:
+from solana.rpc.async_api import AsyncClient
+from telegram import handle_command
+import asyncio
 
+RPC_URL = "https://api.mainnet-beta.solana.com"
 
+async def main():
+    async with AsyncClient(RPC_URL) as client:
+        await handle_command(client)
 
-
+if __name__ == "__main__":
+    asyncio.run(main())
