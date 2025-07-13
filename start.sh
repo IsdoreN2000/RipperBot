@@ -1,6 +1,7 @@
 #!/bin/bash
-echo "[✔] Installing requirements..."
+
+echo "📦 Installing dependencies..."
 pip install -r requirements.txt
 
-echo "[🚀] Starting RipperBot..."
+echo "🚀 Starting Sniper Bot..."
 python bot.py
