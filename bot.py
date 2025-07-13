@@ -1,7 +1,6 @@
 import asyncio
 import os
-import time
-from datetime import datetime, timezone
+from datetime import datetime
 
 from utils import (
     fetch_recent_tokens,
@@ -11,17 +10,18 @@ from utils import (
     send_telegram_message,
 )
 from telegram import handle_command
+from copy_trade import run_copy_trader_loop
 
+# --- Configuration ---
 SEEN_TOKENS = set()
 BUY_AMOUNT_SOL = float(os.getenv("BUY_AMOUNT_SOL", 0.1))
-SCAN_INTERVAL = 2.5  # seconds
+SCAN_INTERVAL = float(os.getenv("SCAN_INTERVAL", 2.5))  # seconds
 AUTO_SELL_MULTIPLIER = float(os.getenv("AUTO_SELL_MULTIPLIER", 2.0))
-
 
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
-
+# --- Main sniper loop ---
 async def sniper_loop():
     while True:
         try:
@@ -35,10 +35,9 @@ async def sniper_loop():
                 eligible, reason = is_token_eligible(token)
 
                 if eligible:
-                    log(f"✅ Eligible token found: {token['symbol']} ({mint})")
+                    log(f"✅ Eligible token found: {token.get('symbol', 'N/A')} ({mint})")
                     await send_telegram_message(
-                        f"🎯 *BUY SIGNAL*\nToken: {token['symbol']}\nMint: {mint}"
-                        # Ensure your send_telegram_message sets parse_mode="Markdown" or "MarkdownV2"
+                        f"🎯 *BUY SIGNAL*\nToken: {token.get('symbol', 'N/A')}\nMint: `{mint}`"
                     )
                     success, tx = await execute_buy(mint)
                     if success:
@@ -54,14 +53,14 @@ async def sniper_loop():
                             )
                         else:
                             await send_telegram_message(
-                                f"⚠️ *Auto-Sell Failed* for {mint}"
+                                f"⚠️ *Auto-Sell Failed* for `{mint}`"
                             )
                     else:
                         await send_telegram_message(
-                            f"⚠️ *Buy Failed* for {token['symbol']}"
+                            f"⚠️ *Buy Failed* for {token.get('symbol', 'N/A')}"
                         )
                 else:
-                    log(f"⏩ Skipped {token['symbol']}: {reason}")
+                    log(f"⏩ Skipped {token.get('symbol', 'N/A')}: {reason}")
 
         except Exception as e:
             log(f"❌ Error: {e}")
@@ -69,17 +68,16 @@ async def sniper_loop():
 
         await asyncio.sleep(SCAN_INTERVAL)
 
-
+# --- Main entry point ---
 async def main():
     await asyncio.gather(
         sniper_loop(),
+        run_copy_trader_loop(),
         handle_command(),
     )
-
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except Exception as e:
         log(f"❌ Fatal Error: {e}")
-
