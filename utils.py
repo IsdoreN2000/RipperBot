@@ -5,6 +5,9 @@ from datetime import datetime, timezone
 import asyncio
 
 from solders.keypair import Keypair
+from solders.pubkey import Pubkey
+from solana.rpc.async_api import AsyncClient
+from solana.rpc.types import TxOpts
 
 # --- Configuration ---
 RPC_URL = os.getenv("RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -18,6 +21,14 @@ BUY_AMOUNT_SOL = float(os.getenv("BUY_AMOUNT_SOL", 0.1))
 SLIPPAGE = float(os.getenv("SLIPPAGE", 3))
 
 keypair = Keypair.from_bytes(bytes(PRIVATE_KEY))
+
+# --- Placeholder: Implement your actual buy txn creation logic ---
+async def create_buy_txn(*args, **kwargs):
+    raise NotImplementedError("Buy transaction logic not implemented yet.")
+
+# --- Placeholder: Implement your actual sell txn creation logic ---
+async def create_sell_txn(*args, **kwargs):
+    raise NotImplementedError("Sell transaction logic not implemented yet.")
 
 # --- Fetch recent tokens ---
 async def fetch_recent_tokens():
@@ -57,15 +68,61 @@ def is_token_eligible(token):
         print(f"[DEBUG] Filter error: {e}")
         return False, f"Error in filter: {e}"
 
+# --- Execute buy (placeholder) ---
+async def execute_buy(mint):
+    try:
+        txn = await create_buy_txn(client, keypair, Pubkey.from_string(mint), BUY_AMOUNT_SOL, SLIPPAGE)
+        sig = await client.send_raw_transaction(txn.serialize(), opts=TxOpts(skip_preflight=True))
+        return True, str(sig.value)
+    except Exception as e:
+        print("Buy failed:", e)
+        return False, None
+
+# --- Execute sell (placeholder) ---
+async def execute_sell(mint, multiplier=2.0):
+    try:
+        txn = await create_sell_txn(client, keypair, Pubkey.from_string(mint), multiplier)
+        sig = await client.send_raw_transaction(txn.serialize(), opts=TxOpts(skip_preflight=True))
+        return True, str(sig.value)
+    except Exception as e:
+        print("Sell failed:", e)
+        return False, None
+
+# --- Telegram notification ---
+async def send_telegram_message(message):
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        print("[DEBUG] Telegram credentials not set.")
+        return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": message,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True
+    }
+    async with aiohttp.ClientSession() as session:
+        await session.post(url, json=payload)
+
 # --- Main async loop ---
 async def main():
+    global client
+    client = AsyncClient(RPC_URL)
     tokens = await fetch_recent_tokens()
     for token in tokens:
         eligible, reason = is_token_eligible(token)
         if eligible:
             print(f"Eligible token: {token['mint']}")
+            await send_telegram_message(f"Eligible token: `{token['mint']}`\nLiquidity: {token.get('liquidity')}\nHolders: {token.get('uniqueHolders')}")
+            # Uncomment below when buy logic is implemented
+            # success, tx_sig = await execute_buy(token['mint'])
+            # if success:
+            #     await send_telegram_message(f"Bought token {token['mint']}! Tx: {tx_sig}")
         else:
             print(f"Token {token.get('mint', 'unknown')} not eligible: {reason}")
+    await client.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
+
