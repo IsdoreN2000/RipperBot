@@ -1,9 +1,9 @@
 services:
   - type: web
-    name: your-service-name
+    name: telegram-sniper-bot
     env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
-    plan: free
     runtime: python
     version: 3.12.3
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
