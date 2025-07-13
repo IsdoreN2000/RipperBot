@@ -1,20 +1,20 @@
-# Telegram bot (stable + compatible with Python 3.12)
+# Telegram bot
 python-telegram-bot==20.3
 
-# Solana dev (solders works fine without py-serde directly)
+# Solana SDK (no py-serde required)
 solders==0.18.0
 
-# Async and networking
-httpx==0.27.0
+# Compatible async + networking stack
+httpx==0.24.1
 websockets==12.0
 aiohttp==3.9.5
 asyncio==3.4.3
 
-# .env support
+# Environment config
 python-dotenv==1.0.1
 
-# Logging (optional but useful)
+# Optional logging
 loguru==0.7.2
 
-# If using Jupiter or external API calls
+# For API calls (e.g. Jupiter or swap APIs)
 requests==2.31.0
