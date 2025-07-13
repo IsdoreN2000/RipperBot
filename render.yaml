@@ -1,4 +1,9 @@
-runtime: python
-version: 3.12.3
-buildCommand: pip install -r requirements.txt
-startCommand: python bot.py
+services:
+  - type: web
+    name: your-service-name
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    plan: free
+    runtime: python
+    version: 3.12.3
