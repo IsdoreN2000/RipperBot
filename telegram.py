@@ -81,17 +81,19 @@ async def show_watched_token():
         )
         await send_telegram_message(msg)
 
-How to Use
-In your main script (e.g., bot.py), create the Solana client and pass it to handle_command:
-from solana.rpc.async_api import AsyncClient
-from telegram import handle_command
-import asyncio
-
-RPC_URL = "https://api.mainnet-beta.solana.com"
-
-async def main():
-    async with AsyncClient(RPC_URL) as client:
-        await handle_command(client)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+# --- 
+# Usage:
+# In your main script (e.g., bot.py), create the Solana client and pass it to handle_command:
+#
+# from solana.rpc.async_api import AsyncClient
+# from telegram import handle_command
+# import asyncio
+#
+# RPC_URL = "https://api.mainnet-beta.solana.com"
+#
+# async def main():
+#     async with AsyncClient(RPC_URL) as client:
+#         await handle_command(client)
+#
+# if __name__ == "__main__":
+#     asyncio.run(main())
