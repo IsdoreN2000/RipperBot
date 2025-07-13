@@ -74,7 +74,7 @@ async def main():
     async with AsyncClient("https://api.mainnet-beta.solana.com") as client:
         await asyncio.gather(
             sniper_loop(client),
-            run_copy_trader_loop(client),
+            run_copy_trader_loop(client),  # <-- client is now passed here
             handle_command(client),
         )
 
