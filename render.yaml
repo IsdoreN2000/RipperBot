@@ -1,9 +1,8 @@
 services:
   - type: web
-    name: telegram-sniper-bot
+    name: solana-sniper-bot
     env: python
-    runtime: python
-    version: 3.12.3
-    plan: free
-    buildCommand: pip install --no-cache-dir -r requirements.txt
-    startCommand: python bot.py
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python bot.py"
+    autoDeploy: false
+    region: oregon
