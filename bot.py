@@ -1,6 +1,7 @@
 import asyncio
 import os
 from datetime import datetime
+from solana.rpc.async_api import AsyncClient
 
 from utils import (
     fetch_recent_tokens,
@@ -22,7 +23,7 @@ def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
 # --- Main sniper loop ---
-async def sniper_loop():
+async def sniper_loop(client):
     while True:
         try:
             tokens = await fetch_recent_tokens()
@@ -70,11 +71,12 @@ async def sniper_loop():
 
 # --- Main entry point ---
 async def main():
-    await asyncio.gather(
-        sniper_loop(),
-        run_copy_trader_loop(),
-        handle_command(),
-    )
+    async with AsyncClient("https://api.mainnet-beta.solana.com") as client:
+        await asyncio.gather(
+            sniper_loop(client),
+            run_copy_trader_loop(client),
+            handle_command(client),
+        )
 
 if __name__ == "__main__":
     try:
