@@ -36,41 +36,44 @@ async def save_positions():
     except Exception as e:
         logging.error(f"Failed to save positions: {e}")
 
-async def scan_ryhad():
-    """Fetch tokens from Ryhad API."""
-    url = "https://ryhad.io/api/tokens"  # Replace with the real endpoint if needed
+async def scan_raydium():
+    """Fetch pools from Raydium API."""
+    url = "https://api-v3.raydium.io/pools"
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(url, timeout=10) as resp:
                 if resp.status == 200:
                     return await resp.json()
                 else:
-                    logging.warning(f"Ryhad API returned status {resp.status}")
+                    logging.warning(f"Raydium API returned status {resp.status}")
         except Exception as e:
-            logging.error(f"Error fetching Ryhad tokens: {e}")
+            logging.error(f"Error fetching Raydium pools: {e}")
     return []
 
-async def run_ryhad_scanner():
-    """Scan Ryhad for new tokens and auto-buy if criteria met."""
+async def run_raydium_scanner():
+    """Scan Raydium for new pools and auto-buy if criteria met."""
     await load_positions()
-    logging.info("📡 Ryhad scanner started.")
+    logging.info("📡 Raydium scanner started.")
     seen = set(positions.keys())
     while True:
-        tokens = await scan_ryhad()
-        for token in tokens:
-            mint = token.get("mint")
+        pools = await scan_raydium()
+        for pool in pools:
+            # Raydium pool object structure: see https://api-v3.raydium.io/docs/#/Pools/get_pools
+            mint = pool.get("baseMint")
             try:
-                liquidity = float(token.get("liquidity", 0))
-                holders = float(token.get("holders", 0))
+                liquidity = float(pool.get("liquidity", 0))
+                # Raydium does not provide holders directly; you may use volume24h or other metrics
+                volume_24h = float(pool.get("volume24h", 0))
             except Exception as e:
-                logging.error(f"Error parsing token data for {mint}: {e}")
+                logging.error(f"Error parsing pool data for {mint}: {e}")
                 continue
 
             if not mint or mint in seen:
                 continue
-            if liquidity >= 10 and holders >= 10:
-                logging.info(f"🚀 Ryhad auto-buying: {mint}")
-                await send_telegram_message(f"🚀 Ryhad Auto-buy: {mint}\nLP: {liquidity}, Holders: {holders}")
+            # --- Your trading criteria here ---
+            if liquidity >= 10 and volume_24h >= 10:
+                logging.info(f"🚀 Raydium auto-buying: {mint}")
+                await send_telegram_message(f"🚀 Raydium Auto-buy: {mint}\nLP: {liquidity}, 24h Volume: {volume_24h}")
                 try:
                     success, tx = await execute_buy(mint, amount_usd=5)
                     if success:
@@ -81,21 +84,21 @@ async def run_ryhad_scanner():
                             "timestamp": time.time()
                         }
                         await save_positions()
-                        await send_telegram_message(f"✅ Ryhad Bought: {mint} at ${price:.4f}\nTx: {tx}")
+                        await send_telegram_message(f"✅ Raydium Bought: {mint} at ${price:.4f}\nTx: {tx}")
                         seen.add(mint)
                     else:
-                        await send_telegram_message(f"❌ Ryhad Buy failed: {mint}")
+                        await send_telegram_message(f"❌ Raydium Buy failed: {mint}")
                 except Exception as e:
                     logging.error(f"Error buying {mint}: {e}")
-                    await send_telegram_message(f"❌ Ryhad Error buying {mint}: {e}")
+                    await send_telegram_message(f"❌ Raydium Error buying {mint}: {e}")
             else:
-                logging.info(f"Skipping {mint}: LP={liquidity}, Holders={holders}")
+                logging.info(f"Skipping {mint}: LP={liquidity}, 24h Volume={volume_24h}")
         await asyncio.sleep(10)
 
 async def monitor_prices():
     """Monitor prices and auto-sell at 2x."""
     await load_positions()
-    logging.info("📈 Ryhad price monitor started.")
+    logging.info("📈 Raydium price monitor started.")
     while True:
         to_remove = []
         for mint, data in positions.items():
@@ -120,7 +123,7 @@ async def monitor_prices():
 
 async def main():
     await asyncio.gather(
-        run_ryhad_scanner(),
+        run_raydium_scanner(),
         monitor_prices()
     )
 
