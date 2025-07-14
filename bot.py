@@ -12,10 +12,11 @@ from solana.rpc.async_api import AsyncClient
 # --- Configure logging globally ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# --- Add sniper wallets to watch ---
+# --- Add sniper wallets to watch (REAL) ---
 WATCHED_WALLETS = [
-    "Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkgS3oG2j7pDn",  # example
-    # Add more sniper wallet addresses here
+    "8CKfrsQkdrkwyZpXVPXTqBo37Ep5dWq2UKR7o2L3TfVu",  # SniperAlpha
+    "Dj8v6HkSSQ8j2RWkLq8Dw4xZ5XPq6pEGpEV9nPUqtrzU",  # CopyLoopX
+    "GZ6PEx2R3GqmvUw8EWEAxEA5etC7mDAv4aHaKq2RY1nD"   # BigBagsBot
 ]
 
 # --- Store tokens already seen (wallet -> set of mints) ---
@@ -46,7 +47,7 @@ def load_cache():
         wallet_token_cache = {}
         logging.error(f"Failed to load token cache: {e}")
 
-def setup_signal_handlers(loop):
+def setup_signal_handlers():
     """Ensure cache is saved on shutdown."""
     def handle_exit(sig, frame):
         logging.info(f"Received {sig.name}, saving cache and exiting...")
@@ -56,9 +57,7 @@ def setup_signal_handlers(loop):
         signal.signal(sig, handle_exit)
 
 async def run_copy_trader_loop(client: AsyncClient):
-    """
-    Main loop: monitors watched wallets and copies new token buys.
-    """
+    """Main loop: monitors watched wallets and copies new token buys."""
     logging.info("🔁 Copy-trader loop started.")
     async with aiohttp.ClientSession() as session:
         while True:
@@ -87,6 +86,8 @@ async def run_copy_trader_loop(client: AsyncClient):
                                             await send_telegram_message(f"❌ Copy failed for {mint}: {e}")
                                 wallet_token_cache[wallet] = current_mints
                                 save_cache()
+                            elif resp.status == 404:
+                                logging.info(f"Wallet {wallet} not tracked on pump.fun (no current tokens).")
                             else:
                                 logging.warning(f"Failed to fetch wallet {wallet}: HTTP {resp.status}")
                     except Exception as e:
@@ -99,9 +100,7 @@ async def run_copy_trader_loop(client: AsyncClient):
             await asyncio.sleep(15)
 
 async def resilient_copy_trader(client: AsyncClient):
-    """
-    Runs the copy trader loop, restarting on error with notification.
-    """
+    """Runs the copy trader loop, restarting on error with notification."""
     while True:
         try:
             await run_copy_trader_loop(client)
@@ -113,7 +112,7 @@ async def resilient_copy_trader(client: AsyncClient):
 if __name__ == "__main__":
     logging.info("🚀 Starting sniper bot...")
     load_cache()
-    setup_signal_handlers(asyncio.get_event_loop())
+    setup_signal_handlers()  # No event loop argument needed
     try:
         async def main():
             async with AsyncClient("https://api.mainnet-beta.solana.com") as client:
