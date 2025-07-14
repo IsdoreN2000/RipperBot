@@ -6,9 +6,6 @@ from solders.keypair import Keypair
 from solana.rpc.async_api import AsyncClient
 from solders.transaction import VersionedTransaction
 
-# If you have a direct Python binding for pump-swap-sdk, import and use it here.
-# Otherwise, this template uses subprocess to call a Node.js script.
-
 async def create_buy_txn(
     client: AsyncClient,
     keypair: Keypair,
@@ -18,9 +15,8 @@ async def create_buy_txn(
 ) -> VersionedTransaction:
     """
     Create a buy transaction for a given token mint using the pump-swap-sdk.
-    This template calls a Node.js script via subprocess. Replace with direct SDK calls if available.
+    This function calls a Node.js script via subprocess. Replace with direct SDK calls if available.
     """
-    # Example: Call a Node.js script and get the serialized transaction
     try:
         result = subprocess.run(
             [
@@ -38,6 +34,8 @@ async def create_buy_txn(
         tx_data = json.loads(result.stdout)
         # Assume tx_data["serialized_tx"] is a base64-encoded transaction
         return VersionedTransaction.deserialize(base64.b64decode(tx_data["serialized_tx"]))
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Node.js script error: {e.stderr.strip()}")
     except Exception as e:
         raise RuntimeError(f"Failed to create buy transaction: {e}")
 
@@ -49,7 +47,7 @@ async def create_sell_txn(
 ) -> VersionedTransaction:
     """
     Create a sell transaction for a given token mint using the pump-swap-sdk.
-    This template calls a Node.js script via subprocess. Replace with direct SDK calls if available.
+    This function calls a Node.js script via subprocess. Replace with direct SDK calls if available.
     """
     try:
         result = subprocess.run(
@@ -66,6 +64,7 @@ async def create_sell_txn(
         )
         tx_data = json.loads(result.stdout)
         return VersionedTransaction.deserialize(base64.b64decode(tx_data["serialized_tx"]))
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Node.js script error: {e.stderr.strip()}")
     except Exception as e:
         raise RuntimeError(f"Failed to create sell transaction: {e}")
-
