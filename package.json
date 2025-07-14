@@ -1,0 +1,13 @@
+{
+  "name": "solana-sniper-bridge",
+  "version": "1.0.0",
+  "description": "Bridge to Pump.fun SDK for sniper bot",
+  "main": "pump_sdk_bridge.js",
+  "scripts": {
+    "start": "node pump_sdk_bridge.js recent"
+  },
+  "dependencies": {
+    "@pump-fun/pump-sdk": "^0.0.7",
+    "@solana/web3.js": "^1.95.2"
+  }
+}
