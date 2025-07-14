@@ -5,6 +5,7 @@ import json
 import os
 import time
 from typing import Dict, Any
+from flask import Flask, request
 
 from utils import execute_buy, send_telegram_message, execute_sell, get_token_price
 
@@ -14,8 +15,9 @@ positions: Dict[str, Any] = {}  # {mint: {buy_price, tx, timestamp}}
 # --- Logging setup ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-async def load_positions():
-    """Load positions from disk."""
+app = Flask(__name__)
+
+def load_positions():
     global positions
     if os.path.exists(POSITIONS_FILE):
         try:
@@ -25,8 +27,7 @@ async def load_positions():
         except Exception as e:
             logging.error(f"Failed to load positions: {e}")
 
-async def save_positions():
-    """Atomically save positions to disk."""
+def save_positions():
     try:
         tmp_file = POSITIONS_FILE + ".tmp"
         with open(tmp_file, "w") as f:
@@ -36,68 +37,41 @@ async def save_positions():
     except Exception as e:
         logging.error(f"Failed to save positions: {e}")
 
-async def scan_raydium():
-    """Fetch pools from Raydium API."""
-    url = "https://api-v3.raydium.io/pools"
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(url, timeout=10) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                else:
-                    logging.warning(f"Raydium API returned status {resp.status}")
-        except Exception as e:
-            logging.error(f"Error fetching Raydium pools: {e}")
-    return []
+@app.route('/new-pool', methods=['POST'])
+def new_pool():
+    data = request.json
+    base_mint = data.get("baseMint")
+    quote_mint = data.get("quoteMint")
+    logging.info(f"🚨 New Raydium pool received: base={base_mint}, quote={quote_mint}")
+    # Trigger your buy logic asynchronously
+    asyncio.get_event_loop().create_task(handle_new_pool(base_mint))
+    return {"status": "ok"}
 
-async def run_raydium_scanner():
-    """Scan Raydium for new pools and auto-buy if criteria met."""
-    await load_positions()
-    logging.info("📡 Raydium scanner started.")
-    seen = set(positions.keys())
-    while True:
-        pools = await scan_raydium()
-        for pool in pools:
-            # Raydium pool object structure: see https://api-v3.raydium.io/docs/#/Pools/get_pools
-            mint = pool.get("baseMint")
-            try:
-                liquidity = float(pool.get("liquidity", 0))
-                # Raydium does not provide holders directly; you may use volume24h or other metrics
-                volume_24h = float(pool.get("volume24h", 0))
-            except Exception as e:
-                logging.error(f"Error parsing pool data for {mint}: {e}")
-                continue
-
-            if not mint or mint in seen:
-                continue
-            # --- Your trading criteria here ---
-            if liquidity >= 10 and volume_24h >= 10:
-                logging.info(f"🚀 Raydium auto-buying: {mint}")
-                await send_telegram_message(f"🚀 Raydium Auto-buy: {mint}\nLP: {liquidity}, 24h Volume: {volume_24h}")
-                try:
-                    success, tx = await execute_buy(mint, amount_usd=5)
-                    if success:
-                        price = await get_token_price(mint)
-                        positions[mint] = {
-                            "buy_price": price,
-                            "tx": tx,
-                            "timestamp": time.time()
-                        }
-                        await save_positions()
-                        await send_telegram_message(f"✅ Raydium Bought: {mint} at ${price:.4f}\nTx: {tx}")
-                        seen.add(mint)
-                    else:
-                        await send_telegram_message(f"❌ Raydium Buy failed: {mint}")
-                except Exception as e:
-                    logging.error(f"Error buying {mint}: {e}")
-                    await send_telegram_message(f"❌ Raydium Error buying {mint}: {e}")
-            else:
-                logging.info(f"Skipping {mint}: LP={liquidity}, 24h Volume={volume_24h}")
-        await asyncio.sleep(10)
+async def handle_new_pool(mint):
+    load_positions()
+    if mint in positions:
+        logging.info(f"Already bought {mint}, skipping.")
+        return
+    try:
+        await send_telegram_message(f"🚀 Raydium Auto-buy: {mint}")
+        success, tx = await execute_buy(mint, amount_usd=5)
+        if success:
+            price = await get_token_price(mint)
+            positions[mint] = {
+                "buy_price": price,
+                "tx": tx,
+                "timestamp": time.time()
+            }
+            save_positions()
+            await send_telegram_message(f"✅ Raydium Bought: {mint} at ${price:.4f}\nTx: {tx}")
+        else:
+            await send_telegram_message(f"❌ Raydium Buy failed: {mint}")
+    except Exception as e:
+        logging.error(f"Error buying {mint}: {e}")
+        await send_telegram_message(f"❌ Raydium Error buying {mint}: {e}")
 
 async def monitor_prices():
-    """Monitor prices and auto-sell at 2x."""
-    await load_positions()
+    load_positions()
     logging.info("📈 Raydium price monitor started.")
     while True:
         to_remove = []
@@ -118,17 +92,13 @@ async def monitor_prices():
         for mint in to_remove:
             positions.pop(mint, None)
         if to_remove:
-            await save_positions()
+            save_positions()
         await asyncio.sleep(60)
 
-async def main():
-    await asyncio.gather(
-        run_raydium_scanner(),
-        monitor_prices()
-    )
+def start_monitor():
+    loop = asyncio.get_event_loop()
+    loop.create_task(monitor_prices())
+    app.run(host="0.0.0.0", port=5000)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except Exception as e:
-        logging.critical(f"🔥 FATAL: Bot crashed at startup: {e}", exc_info=True)
+    start_monitor()
