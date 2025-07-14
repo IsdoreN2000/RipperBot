@@ -43,11 +43,18 @@ async def fetch_recent_tokens():
 # --- Token eligibility filter (utility, optional) ---
 def is_token_eligible(token):
     try:
+        # Log the type and content of token for debugging
+        logging.info(f"Token type: {type(token)}; token: {token}")
+
         age = datetime.now(timezone.utc).timestamp() - int(token.get("timestamp", 0))
         liquidity = float(token.get("liquidity", 0))
         holders = int(token.get("uniqueHolders", 0))
 
-        logging.info(f"Token {token.get('mint', 'unknown')} - Age: {age:.2f}s, Liquidity: {liquidity}, Holders: {holders}")
+        logging.info(
+            f"Token {token.get('mint', 'unknown')} - "
+            f"Name: {token.get('name', 'unknown')} - "
+            f"Age: {age:.2f}s, Liquidity: {liquidity}, Holders: {holders}"
+        )
 
         if age < 1 or age > 180:
             logging.info("Filter reject: Token age not within 1s to 3min range")
@@ -149,3 +156,26 @@ async def send_telegram_message(message):
             await session.post(url, json=payload, timeout=10)
         except Exception as e:
             logging.error(f"Error sending Telegram message: {e}")
+
+# --- Example main loop (for illustration) ---
+async def main():
+    tokens = await fetch_recent_tokens()
+    for token in tokens:
+        # Always use .get() for dictionary access, never .name
+        token_name = token.get("name", "unknown")
+        logging.info(f"Processing token: {token_name}")
+        eligible, reason = is_token_eligible(token)
+        if eligible:
+            logging.info(f"Token {token_name} is eligible, attempting buy.")
+            try:
+                success, sig = await execute_buy(token.get("mint"))
+                if success:
+                    await send_telegram_message(f"Bought token {token_name} ({token.get('mint')})\nTx: {sig}")
+            except Exception as e:
+                logging.error(f"Buy failed for {token_name}: {e}")
+        else:
+            logging.info(f"Token {token_name} not eligible: {reason}")
+
+# To run the main loop, use:
+# import asyncio
+# asyncio.run(main())
