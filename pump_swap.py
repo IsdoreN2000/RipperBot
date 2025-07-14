@@ -14,14 +14,15 @@ async def create_buy_txn(
     slippage: float
 ) -> VersionedTransaction:
     """
-    Create a buy transaction for a given token mint using the pump-swap-sdk.
-    This function calls a Node.js script via subprocess. Replace with direct SDK calls if available.
+    Create a buy transaction for a given token mint using the pump-sdk bridge.
+    This function calls the unified Node.js script via subprocess.
     """
     try:
         result = subprocess.run(
             [
                 "node",
-                "pump_buy.js",  # Your Node.js script
+                "pump_sdk_bridge.js",  # Unified Node.js bridge script
+                "buy",
                 str(mint),
                 str(sol_amount),
                 str(slippage),
@@ -32,7 +33,7 @@ async def create_buy_txn(
             text=True
         )
         tx_data = json.loads(result.stdout)
-        # Assume tx_data["serialized_tx"] is a base64-encoded transaction
+        # tx_data["serialized_tx"] is a base64-encoded transaction
         return VersionedTransaction.deserialize(base64.b64decode(tx_data["serialized_tx"]))
     except subprocess.CalledProcessError as e:
         raise RuntimeError(f"Node.js script error: {e.stderr.strip()}")
@@ -46,14 +47,15 @@ async def create_sell_txn(
     multiplier: float
 ) -> VersionedTransaction:
     """
-    Create a sell transaction for a given token mint using the pump-swap-sdk.
-    This function calls a Node.js script via subprocess. Replace with direct SDK calls if available.
+    Create a sell transaction for a given token mint using the pump-sdk bridge.
+    This function calls the unified Node.js script via subprocess.
     """
     try:
         result = subprocess.run(
             [
                 "node",
-                "pump_sell.js",  # Your Node.js script
+                "pump_sdk_bridge.js",  # Unified Node.js bridge script
+                "sell",
                 str(mint),
                 str(multiplier),
                 base64.b64encode(bytes(keypair)).decode("utf-8")
