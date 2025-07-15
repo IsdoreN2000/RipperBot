@@ -1,85 +1,113 @@
 import os
-import json
-import time
-import base64
 import aiohttp
 import logging
+import asyncio
 from datetime import datetime, timezone
+import requests
 
-from solana.rpc.async_api import AsyncClient
-from solana.rpc.types import MemcmpOpts, TokenAccountOpts
-
-logging.basicConfig(level=logging.INFO)
-
+HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
+HELIUS_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+PUMP_PROGRAM_ID = "C5pN1p7tMUT9gCgQPxz2CcsiLzgyWTu1S5Gu1w1pMxEz"
 JUPITER_API_URL = "https://quote-api.jup.ag/v1/quote"
-INPUT_MINT = "So11111111111111111111111111111111111111112"  # Wrapped SOL
 
-async def get_token_mints_from_tx(signature, session, helius_url):
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getTransaction",
-        "params": [signature, {
-            "encoding": "jsonParsed",
-            "maxSupportedTransactionVersion": 0  # fixes error
-        }]
-    }
-    try:
-        async with session.post(helius_url, json=payload, timeout=10) as resp:
-            result = await resp.json()
-            logging.debug(f"getTransaction result for {signature}: {result}")
-            tx = result.get("result", {}).get("transaction", {})
-            mints = set()
-            for instr in tx.get("message", {}).get("instructions", []):
-                if "parsed" in instr and "info" in instr["parsed"]:
-                    info = instr["parsed"]["info"]
-                    if "mint" in info:
-                        mint = info["mint"]
-                        if mint.endswith("pump"):
-                            mints.add(mint)
-            return list(mints)
-    except Exception as e:
-        logging.warning(f"Failed to parse mints from {signature}: {e}")
-        return []
+MIN_TOKEN_AGE_SECONDS = 40
 
-async def has_liquidity(input_mint, output_mint, amount=10000000, slippage=3):
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+async def has_liquidity(token_mint):
     params = {
-        "inputMint": input_mint,
-        "outputMint": output_mint,
-        "amount": str(amount),
-        "slippage": str(slippage)
+        "inputMint": "So11111111111111111111111111111111111111112",
+        "outputMint": token_mint,
+        "amount": str(int(0.01 * 1e9)),  # 0.01 SOL in lamports
+        "slippageBps": 100,
     }
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(JUPITER_API_URL, params=params, timeout=10) as resp:
+                if resp.status != 200:
+                    logging.warning(f"Liquidity check failed for {token_mint}: HTTP {resp.status}")
+                    return False
                 data = await resp.json()
-                if "data" in data and len(data["data"]) > 0:
-                    return True
+                has_route = len(data.get("data", [])) > 0
+                logging.info(f"Liquidity {'OK' if has_route else 'NO'} for {token_mint}")
+                return has_route
     except Exception as e:
-        logging.warning(f"Liquidity check failed for {output_mint}: {e}")
-    return False
+        logging.warning(f"Liquidity check failed for {token_mint}: {e}")
+        return False
 
-async def get_token_creation_time(mint_address, helius_url):
-    url = helius_url
+def fetch_recent_token_mints(limit=20):
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
         "method": "getSignaturesForAddress",
-        "params": [mint_address, {"limit": 1}]
+        "params": [PUMP_PROGRAM_ID, {"limit": limit}]
     }
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, timeout=10) as resp:
-                result = await resp.json()
-                sigs = result.get("result", [])
-                if len(sigs) > 0:
-                    block_time = sigs[0].get("blockTime", 0)
-                    return block_time
+        response = requests.post(HELIUS_URL, json=payload)
+        response.raise_for_status()
+        signatures = [tx["signature"] for tx in response.json().get("result", [])]
     except Exception as e:
-        logging.warning(f"Token creation time fetch failed for {mint_address}: {e}")
-    return 0
+        logging.warning(f"Failed to fetch signatures: {e}")
+        return []
 
-def is_token_old_enough(created_at_unix, min_age_sec=180):
-    now = int(time.time())
-    age = now - created_at_unix
-    return age >= min_age_sec
+    token_mints = []
+    for sig in signatures:
+        mint, ts = extract_mint_and_timestamp(sig)
+        if mint and ts and is_recent(ts):
+            token_mints.append(mint)
+    logging.info(f"Recent token mints: {token_mints}")
+    return token_mints
+
+def extract_mint_and_timestamp(signature):
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getTransaction",
+        "params": [signature, {"encoding": "jsonParsed"}]
+    }
+    try:
+        response = requests.post(HELIUS_URL, json=payload)
+        response.raise_for_status()
+        result = response.json().get("result", {})
+        block_time = result.get("blockTime")
+        tx = result.get("transaction", {})
+        message = tx.get("message", {})
+        instructions = message.get("instructions", [])
+
+        for instr in instructions:
+            if "parsed" in instr and "info" in instr["parsed"]:
+                info = instr["parsed"]["info"]
+                mint = info.get("mint")
+                if mint:
+                    return mint, block_time
+    except Exception as e:
+        logging.warning(f"Error parsing transaction {signature}: {e}")
+    return None, None
+
+def is_recent(block_time):
+    if not block_time:
+        return False
+    now = datetime.now(timezone.utc).timestamp()
+    return (now - block_time) <= MIN_TOKEN_AGE_SECONDS
+
+async def main():
+    token_mints = fetch_recent_token_mints()
+    with_liquidity = 0
+    without_liquidity = 0
+
+    for token in token_mints:
+        has_liq = await has_liquidity(token)
+        if has_liq:
+            with_liquidity += 1
+        else:
+            without_liquidity += 1
+
+    logging.info(
+        f"Batch summary: {with_liquidity} with liquidity, {without_liquidity} without liquidity, out of {len(token_mints)} tokens"
+    )
+
+if __name__ == "__main__":
+    asyncio.run(main())
