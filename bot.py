@@ -13,6 +13,8 @@ import requests
 
 logging.basicConfig(level=logging.INFO)
 
+print("=== BOT.PY STARTED ===")  # Confirm script is running
+
 # Load environment variables
 RPC_URL = os.getenv("RPC_URL", "https://mainnet.helius-rpc.com/?api-key=" + os.getenv("HELIUS_API_KEY"))
 PRIVATE_KEY = json.loads(os.getenv("PRIVATE_KEY"))
@@ -28,7 +30,7 @@ PUMP_PROGRAM_ID = "C5pN1p7tMUT9gCgQPxz2CcsiLzgyWTu1S5Gu1w1pMxEz"
 JUPITER_API_URL = "https://quote-api.jup.ag/v1/quote"
 
 # === HELIUS TX FETCHING ===
-def get_recent_signatures(limit=5):
+def get_recent_signatures(limit=10):
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -39,8 +41,10 @@ def get_recent_signatures(limit=5):
         response = requests.post(HELIUS_URL, json=payload)
         response.raise_for_status()
         result = response.json()
+        print("DEBUG: getSignaturesForAddress result:", result)  # Debug print
         return [tx["signature"] for tx in result.get("result", [])]
     except Exception as e:
+        print("DEBUG: Exception in get_recent_signatures:", e)
         logging.warning(f"Failed to fetch signatures: {e}")
         return []
 
@@ -55,6 +59,7 @@ def get_token_mints_from_tx(signature):
         response = requests.post(HELIUS_URL, json=payload)
         response.raise_for_status()
         result = response.json()
+        print(f"DEBUG: getTransaction result for {signature}:", result)  # Debug print
         tx = result.get("result", {}).get("transaction", {})
         mints = set()
         for instr in tx.get("message", {}).get("instructions", []):
@@ -64,15 +69,22 @@ def get_token_mints_from_tx(signature):
                     mints.add(info["mint"])
         return list(mints)
     except Exception as e:
+        print(f"DEBUG: Exception in get_token_mints_from_tx for {signature}:", e)
         logging.warning(f"Failed to parse tx {signature}: {e}")
         return []
 
-async def fetch_recent_tokens(limit=5):
+async def fetch_recent_tokens(limit=10):
     signatures = get_recent_signatures(limit)
+    if not signatures:
+        print("DEBUG: No signatures found from get_recent_signatures.")
     all_mints = set()
     for sig in signatures:
         mints = get_token_mints_from_tx(sig)
+        if not mints:
+            print(f"DEBUG: No mints found in transaction {sig}.")
         all_mints.update(mints)
+    if not all_mints:
+        print("DEBUG: No mints found from any transaction.")
     return [{"mint": mint} for mint in all_mints]
 
 # === BUYING & SELLING ===
