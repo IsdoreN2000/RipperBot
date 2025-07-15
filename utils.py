@@ -9,67 +9,172 @@ from solders.transaction import VersionedTransaction
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.types import TxOpts
 import asyncio
+import requests
 
 logging.basicConfig(level=logging.INFO)
 
-# --- Helius RPC Setup ---
-HELIUS_KEY = os.getenv("HELIUS_API_KEY")
-if not HELIUS_KEY:
-    raise EnvironmentError("❌ HELIUS_API_KEY environment variable is not set.")
-RPC_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}"
-
-private_key_env = os.getenv("PRIVATE_KEY")
-if private_key_env is None:
-    raise EnvironmentError("PRIVATE_KEY environment variable is not set.")
-PRIVATE_KEY = json.loads(private_key_env)
+# Load environment variables
+RPC_URL = os.getenv("RPC_URL", "https://mainnet.helius-rpc.com/?api-key=" + os.getenv("HELIUS_API_KEY"))
+PRIVATE_KEY = json.loads(os.getenv("PRIVATE_KEY"))
 keypair = Keypair.from_bytes(bytes(PRIVATE_KEY))
 
 BUY_AMOUNT_SOL = float(os.getenv("BUY_AMOUNT_SOL", 0.1))
 SLIPPAGE = float(os.getenv("SLIPPAGE", 3))
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
+HELIUS_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+PUMP_PROGRAM_ID = "C5pN1p7tMUT9gCgQPxz2CcsiLzgyWTu1S5Gu1w1pMxEz"
 JUPITER_API_URL = "https://quote-api.jup.ag/v1/quote"
 
-async def fetch_recent_tokens():
-    url = "https://api.pump.fun/tokens?sort=recent"
+# === HELIUS TX FETCHING ===
+def get_recent_signatures(limit=20):
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getSignaturesForAddress",
+        "params": [PUMP_PROGRAM_ID, {"limit": limit}]
+    }
+    try:
+        response = requests.post(HELIUS_URL, json=payload)
+        response.raise_for_status()
+        result = response.json()
+        print("DEBUG: getSignaturesForAddress result:", result)  # Debug print
+        return [tx["signature"] for tx in result.get("result", [])]
+    except Exception as e:
+        logging.warning(f"Failed to fetch signatures: {e}")
+        return []
+
+def get_token_mints_from_tx(signature):
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getTransaction",
+        "params": [signature, {"encoding": "jsonParsed"}]
+    }
+    try:
+        response = requests.post(HELIUS_URL, json=payload)
+        response.raise_for_status()
+        result = response.json()
+        print(f"DEBUG: getTransaction result for {signature}:", result)  # Debug print
+        tx = result.get("result", {}).get("transaction", {})
+        mints = set()
+        for instr in tx.get("message", {}).get("instructions", []):
+            if "parsed" in instr and "info" in instr["parsed"]:
+                info = instr["parsed"]["info"]
+                if "mint" in info:
+                    mints.add(info["mint"])
+        return list(mints)
+    except Exception as e:
+        logging.warning(f"Failed to parse tx {signature}: {e}")
+        return []
+
+async def fetch_recent_tokens(limit=20):
+    signatures = get_recent_signatures(limit)
+    all_mints = set()
+    for sig in signatures:
+        mints = get_token_mints_from_tx(sig)
+        all_mints.update(mints)
+    return [{"mint": mint} for mint in all_mints]
+
+# === BUYING & SELLING ===
+async def get_swap_route(input_mint, output_mint, amount, slippage=3):
+    params = {
+        "inputMint": input_mint,
+        "outputMint": output_mint,
+        "amount": str(amount),
+        "slippage": str(slippage),
+        "onlyDirectRoutes": "true"
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.get(JUPITER_API_URL, params=params, timeout=10) as resp:
+            if resp.status != 200:
+                raise Exception(f"Jupiter error: {resp.status}")
+            data = await resp.json()
+            routes = data.get("data")
+            if not routes or "swapTransaction" not in routes[0]:
+                raise Exception("No route or swapTransaction found")
+            return routes[0]
+
+async def execute_swap(route, client):
+    txn_b64 = route['swapTransaction']
+    txn_bytes = base64.b64decode(txn_b64)
+    txn = VersionedTransaction.deserialize(txn_bytes)
+    txn.sign([keypair])
+    sig = await client.send_raw_transaction(txn.serialize(), opts=TxOpts(skip_preflight=True))
+    await client.confirm_transaction(sig.value)
+    return sig.value
+
+async def execute_buy(mint, amount_usd=None):
+    input_mint = "So11111111111111111111111111111111111111112"
+    output_mint = mint
+    amount = int(BUY_AMOUNT_SOL * 1_000_000_000)
+    async with AsyncClient(RPC_URL) as client:
+        route = await get_swap_route(input_mint, output_mint, amount, SLIPPAGE)
+        sig = await execute_swap(route, client)
+    return True, sig
+
+async def execute_sell(mint, multiplier=2.0):
+    input_mint = mint
+    output_mint = "So11111111111111111111111111111111111111112"
+    amount = int(BUY_AMOUNT_SOL * multiplier * 1_000_000_000)
+    async with AsyncClient(RPC_URL) as client:
+        route = await get_swap_route(input_mint, output_mint, amount, SLIPPAGE)
+        sig = await execute_swap(route, client)
+    return True, sig
+
+async def get_token_price(mint: str) -> float:
+    url = f"https://api.pump.fun/price/{mint}"
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, timeout=10) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                return float(data.get("price", 0))
+            else:
+                raise Exception(f"Price fetch failed for {mint}: {resp.status}")
+
+# === TELEGRAM NOTIFICATIONS ===
+async def send_telegram_message(message):
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True
+    }
     async with aiohttp.ClientSession() as session:
         try:
-            async with session.get(url, timeout=10) as resp:
-                if resp.status == 200:
-                    tokens = await resp.json()
-                    logging.info(f"Fetched {len(tokens)} tokens")
-                    return tokens
-                else:
-                    logging.warning(f"Failed to fetch tokens, status: {resp.status}")
-                    return []
+            await session.post(url, json=payload, timeout=10)
         except Exception as e:
-            logging.error(f"Error fetching tokens: {e}")
-            return []
+            logging.error(f"Telegram error: {e}")
 
-def is_token_eligible(token, max_age_seconds=600):
-    """
-    Returns True if the token is younger than max_age_seconds.
-    Expects token to have a 'created_at', 'createdAt', or 'timestamp' field.
-    """
-    try:
-        # Adjust the key according to the actual API response
-        created_at = token.get("created_at") or token.get("createdAt") or token.get("timestamp")
-        if not created_at:
-            return False
-        # If the timestamp is in milliseconds, convert to seconds
-        if created_at > 1e12:
-            created_at = created_at / 1000
-        age = datetime.now(timezone.utc).timestamp() - float(created_at)
-        return age < max_age_seconds
-    except Exception as e:
-        logging.error(f"Error checking token eligibility: {e}")
-        return False
+# === TOKEN FILTERING ===
+def is_token_eligible(token):
+    # Replace with logic if you later add metadata via other APIs
+    mint = token.get("mint")
+    if not mint:
+        return False, "Missing mint"
+    return True, ""
 
-# --- Example usage ---
+# === MAIN LOOP ===
 async def main():
-    tokens = await fetch_recent_tokens()
-    eligible_tokens = [t for t in tokens if is_token_eligible(t)]
-    logging.info(f"Eligible tokens: {len(eligible_tokens)}")
-    for token in eligible_tokens:
-        logging.info(f"Eligible token: {token.get('mint', 'unknown')}")
+    tokens = await fetch_recent_tokens(limit=20)
+    logging.info(f"Recent token mints: {[t['mint'] for t in tokens]}")
+    for token in tokens:
+        name = token.get("name", "unknown")
+        eligible, reason = is_token_eligible(token)
+        if eligible:
+            try:
+                success, sig = await execute_buy(token.get("mint"))
+                if success:
+                    await send_telegram_message(f"✅ Bought {name} ({token.get('mint')})\nTx: {sig}")
+            except Exception as e:
+                logging.error(f"Buy failed for {name}: {e}")
+        else:
+            logging.info(f"{name} not eligible: {reason}")
+        await asyncio.sleep(1)
 
 if __name__ == "__main__":
     asyncio.run(main())
