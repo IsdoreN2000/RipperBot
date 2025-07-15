@@ -10,10 +10,11 @@ from solana.rpc.async_api import AsyncClient
 from solana.rpc.types import TxOpts
 import asyncio
 import requests
+import traceback
 
 logging.basicConfig(level=logging.INFO)
 
-print("=== BOT.PY STARTED ===")  # Confirm script is running
+print("=== BOT.PY STARTED ===")
 
 # Load environment variables
 RPC_URL = os.getenv("RPC_URL", "https://mainnet.helius-rpc.com/?api-key=" + os.getenv("HELIUS_API_KEY"))
@@ -41,7 +42,7 @@ def get_recent_signatures(limit=10):
         response = requests.post(HELIUS_URL, json=payload)
         response.raise_for_status()
         result = response.json()
-        print("DEBUG: getSignaturesForAddress result:", result)  # Debug print
+        print("DEBUG: getSignaturesForAddress result:", result)
         return [tx["signature"] for tx in result.get("result", [])]
     except Exception as e:
         print("DEBUG: Exception in get_recent_signatures:", e)
@@ -59,24 +60,24 @@ def get_token_mints_from_tx(signature):
         response = requests.post(HELIUS_URL, json=payload)
         response.raise_for_status()
         result = response.json()
-        print(f"DEBUG: getTransaction result for {signature}:", result)  # Debug print
+        print(f"DEBUG: getTransaction result for {signature}:", result)
         tx = result.get("result", {}).get("transaction", {})
         meta = result.get("result", {}).get("meta", {})
         mints = set()
 
-        # 1. Extract from preTokenBalances and postTokenBalances
+        # From balances
         for bal in meta.get("preTokenBalances", []) + meta.get("postTokenBalances", []):
             if "mint" in bal:
                 mints.add(bal["mint"])
 
-        # 2. Extract from top-level instructions
+        # From top-level instructions
         for instr in tx.get("message", {}).get("instructions", []):
             if "parsed" in instr and "info" in instr["parsed"]:
                 info = instr["parsed"]["info"]
                 if "mint" in info:
                     mints.add(info["mint"])
 
-        # 3. Extract from innerInstructions
+        # From inner instructions
         for inner in meta.get("innerInstructions", []):
             for instr in inner.get("instructions", []):
                 if "parsed" in instr and "info" in instr["parsed"]:
@@ -116,11 +117,13 @@ async def get_swap_route(input_mint, output_mint, amount, slippage=3):
     async with aiohttp.ClientSession() as session:
         async with session.get(JUPITER_API_URL, params=params, timeout=10) as resp:
             if resp.status != 200:
-                raise Exception(f"Jupiter error: {resp.status}")
+                raise Exception(f"Jupiter API error: {resp.status}")
             data = await resp.json()
-            routes = data.get("data")
-            if not routes or "swapTransaction" not in routes[0]:
-                raise Exception("No route or swapTransaction found")
+            routes = data.get("data", [])
+            if not routes:
+                raise Exception(f"No routes found for mint: {output_mint}")
+            if "swapTransaction" not in routes[0]:
+                raise Exception(f"No swapTransaction in route for mint: {output_mint}")
             return routes[0]
 
 async def execute_swap(route, client):
@@ -142,8 +145,9 @@ async def execute_buy(mint, amount_usd=None):
             sig = await execute_swap(route, client)
         return True, sig
     except Exception as e:
-        print(f"DEBUG: execute_buy failed for {mint}: {e}")
-        raise
+        logging.error(f"execute_buy failed for {mint}: {e}")
+        traceback.print_exc()
+        return False, None
 
 async def execute_sell(mint, multiplier=2.0):
     input_mint = mint
@@ -183,7 +187,6 @@ async def send_telegram_message(message):
 
 # === TOKEN FILTERING ===
 def is_token_eligible(token):
-    # Replace with logic if you later add metadata via other APIs
     mint = token.get("mint")
     if not mint:
         return False, "Missing mint"
@@ -195,15 +198,18 @@ async def main():
     logging.info(f"Recent token mints: {[t['mint'] for t in tokens]}")
     for token in tokens:
         mint = token.get("mint", "unknown")
-        name = token.get("name", "unknown")
+        name = token.get("name", mint[:6])  # fallback to part of mint
         eligible, reason = is_token_eligible(token)
         if eligible:
             try:
                 success, sig = await execute_buy(mint)
                 if success:
-                    await send_telegram_message(f"✅ Bought {name} ({mint})\nTx: {sig}")
+                    await send_telegram_message(f"✅ Bought {name} ({mint})\nTx: https://solscan.io/tx/{sig}")
+                else:
+                    await send_telegram_message(f"❌ Buy failed for {name} ({mint})")
             except Exception as e:
                 logging.error(f"Buy failed for {name} ({mint}): {e}")
+                await send_telegram_message(f"❌ Exception buying {name} ({mint}): {e}")
         else:
             logging.info(f"{name} not eligible: {reason}")
         await asyncio.sleep(1)
