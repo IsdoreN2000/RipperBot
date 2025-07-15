@@ -1,36 +1,103 @@
 import os
-import json
-import base64
 import aiohttp
 import logging
-from datetime import datetime
-from solders.keypair import Keypair
-from solders.transaction import VersionedTransaction
-from solana.rpc.async_api import AsyncClient
-from solana.rpc.types import TxOpts
+import json
 import asyncio
+import random
+from datetime import datetime, timezone
 import requests
-import traceback
 
-logging.basicConfig(level=logging.INFO)
-print("=== BOT.PY STARTED ===")
-
-# Load environment variables
-RPC_URL = os.getenv("RPC_URL", "https://mainnet.helius-rpc.com/?api-key=" + os.getenv("HELIUS_API_KEY"))
-PRIVATE_KEY = json.loads(os.getenv("PRIVATE_KEY"))
-keypair = Keypair.from_bytes(bytes(PRIVATE_KEY))
-BUY_AMOUNT_SOL = float(os.getenv("BUY_AMOUNT_SOL", 0.01))
-SLIPPAGE = float(os.getenv("SLIPPAGE", 3))
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
 HELIUS_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
-PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+PUMP_PROGRAM_ID = "C5pN1p7tMUT9gCgQPxz2CcsiLzgyWTu1S5Gu1w1pMxEz"
 JUPITER_API_URL = "https://quote-api.jup.ag/v1/quote"
-WRAPPED_SOL = "So11111111111111111111111111111111111111112"
 
-# --- HELIUS TX FETCHING ---
-def get_recent_signatures(limit=10):
+MIN_TOKEN_AGE_SECONDS = 180
+
+# --- Structured JSON Logging Setup ---
+class JsonFormatter(logging.Formatter):
+    def format(self, record):
+        log_record = {
+            "timestamp": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "message": record.getMessage(),
+            "name": record.name,
+        }
+        if hasattr(record, "extra_data"):
+            log_record.update(record.extra_data)
+        if record.exc_info:
+            log_record["exception"] = self.formatException(record.exc_info)
+        return json.dumps(log_record)
+
+json_handler = logging.FileHandler("bot.json.log")
+json_handler.setFormatter(JsonFormatter())
+
+# Standard log setup (console + file)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    handlers=[
+        logging.FileHandler("bot.log"),
+        logging.StreamHandler(),
+        json_handler
+    ]
+)
+
+def log_with_context(level, msg, **kwargs):
+    extra = {"extra_data": kwargs}
+    logging.log(level, msg, extra=extra)
+
+# --- Async Liquidity Check with Retry and Logging ---
+async def has_liquidity(token_mint, retries=2):
+    params = {
+        "inputMint": "So11111111111111111111111111111111111111112",
+        "outputMint": token_mint,
+        "amount": str(int(0.01 * 1e9)),  # 0.01 SOL in lamports
+        "slippageBps": 100,
+    }
+    for attempt in range(retries):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(JUPITER_API_URL, params=params, timeout=10) as resp:
+                    if resp.status != 200:
+                        log_with_context(
+                            logging.WARNING,
+                            f"[{resp.status}] Liquidity API for {token_mint}",
+                            token_mint=token_mint,
+                            status=resp.status,
+                            attempt=attempt+1
+                        )
+                        return False
+                    data = await resp.json()
+                    has_route = len(data.get("data", [])) > 0
+                    log_with_context(
+                        logging.INFO,
+                        f"[Liquidity {'OK' if has_route else 'No'}] Token: {token_mint}",
+                        token_mint=token_mint,
+                        has_route=has_route
+                    )
+                    return has_route
+        except asyncio.TimeoutError:
+            log_with_context(
+                logging.WARNING,
+                f"[Retry {attempt+1}/{retries}] Timeout for {token_mint}",
+                token_mint=token_mint,
+                attempt=attempt+1
+            )
+            await asyncio.sleep((2 ** attempt) + random.uniform(0, 1))
+        except Exception as e:
+            log_with_context(
+                logging.WARNING,
+                f"[Error] Liquidity check failed for {token_mint}: {e}",
+                token_mint=token_mint,
+                error=str(e),
+                attempt=attempt+1
+            )
+            return False
+    return False
+
+# --- Fetch Recent Token Mints ---
+def fetch_recent_token_mints(limit=20):
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -40,162 +107,75 @@ def get_recent_signatures(limit=10):
     try:
         response = requests.post(HELIUS_URL, json=payload)
         response.raise_for_status()
-        result = response.json()
-        return [tx["signature"] for tx in result.get("result", [])]
+        signatures = [tx["signature"] for tx in response.json().get("result", [])]
     except Exception as e:
-        logging.warning(f"Failed to fetch signatures: {e}")
+        log_with_context(logging.WARNING, "Failed to fetch signatures", error=str(e))
         return []
 
-def get_token_mints_from_tx(signature):
+    token_mints = []
+    for sig in signatures:
+        mint, ts = extract_mint_and_timestamp(sig)
+        if mint and ts and is_recent(ts):
+            token_mints.append(mint)
+    log_with_context(logging.INFO, "Recent token mints", token_mints=token_mints)
+    return token_mints
+
+# --- Extract Mint and Timestamp from Transaction ---
+def extract_mint_and_timestamp(signature):
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
         "method": "getTransaction",
-        "params": [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
+        "params": [signature, {"encoding": "jsonParsed"}]
     }
     try:
         response = requests.post(HELIUS_URL, json=payload)
         response.raise_for_status()
-        result = response.json()
-        meta = result.get("result", {}).get("meta", {})
-        tx = result.get("result", {}).get("transaction", {})
-        mints = set()
+        result = response.json().get("result", {})
+        block_time = result.get("blockTime")
+        tx = result.get("transaction", {})
+        message = tx.get("message", {})
+        instructions = message.get("instructions", [])
 
-        for bal in meta.get("preTokenBalances", []) + meta.get("postTokenBalances", []):
-            if "mint" in bal:
-                mints.add(bal["mint"])
-
-        for instr in tx.get("message", {}).get("instructions", []):
+        for instr in instructions:
             if "parsed" in instr and "info" in instr["parsed"]:
-                if "mint" in instr["parsed"]["info"]:
-                    mints.add(instr["parsed"]["info"]["mint"])
-
-        for inner in meta.get("innerInstructions", []):
-            for instr in inner.get("instructions", []):
-                if "parsed" in instr and "info" in instr["parsed"]:
-                    if "mint" in instr["parsed"]["info"]:
-                        mints.add(instr["parsed"]["info"]["mint"])
-
-        return list(mints)
+                info = instr["parsed"]["info"]
+                mint = info.get("mint")
+                if mint:
+                    return mint, block_time
     except Exception as e:
-        logging.warning(f"Failed to parse tx {signature}: {e}")
-        return []
+        log_with_context(logging.WARNING, f"Error parsing transaction {signature}", error=str(e))
+    return None, None
 
-async def fetch_recent_tokens(limit=10):
-    signatures = get_recent_signatures(limit)
-    all_mints = set()
-    for sig in signatures:
-        mints = get_token_mints_from_tx(sig)
-        all_mints.update(mints)
-    return [{"mint": mint} for mint in all_mints if mint != WRAPPED_SOL]
-
-# --- LIQUIDITY CHECK ---
-async def has_liquidity(mint):
-    params = {
-        "inputMint": WRAPPED_SOL,
-        "outputMint": mint,
-        "amount": str(int(BUY_AMOUNT_SOL * 1_000_000_000)),
-        "slippage": str(SLIPPAGE),
-        "onlyDirectRoutes": "true"
-    }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(JUPITER_API_URL, params=params, timeout=10) as resp:
-                data = await resp.json()
-                if resp.status != 200:
-                    logging.warning(f"Jupiter liquidity check error: {resp.status}, response: {data}")
-                    return False
-                return bool(data.get("data"))
-    except Exception as e:
-        logging.warning(f"Liquidity check failed for {mint}: {e}\n{traceback.format_exc()}")
+# --- Check if Token is Recent ---
+def is_recent(block_time):
+    if not block_time:
         return False
+    now = datetime.now(timezone.utc).timestamp()
+    return (now - block_time) <= MIN_TOKEN_AGE_SECONDS
 
-# --- BUYING ---
-async def get_swap_route(input_mint, output_mint, amount, slippage=3):
-    params = {
-        "inputMint": input_mint,
-        "outputMint": output_mint,
-        "amount": str(amount),
-        "slippage": str(slippage),
-        "onlyDirectRoutes": "true"
-    }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(JUPITER_API_URL, params=params, timeout=10) as resp:
-                data = await resp.json()
-                if resp.status != 200:
-                    raise Exception(f"Jupiter error: {resp.status}, response: {data}")
-                if not data.get("data") or "swapTransaction" not in data["data"][0]:
-                    raise Exception(f"No route or swapTransaction found. Full response: {data}")
-                return data["data"][0]
-    except Exception as e:
-        logging.error(f"get_swap_route error ({output_mint}): {e}\n{traceback.format_exc()}")
-        raise
-
-async def execute_swap(route, client):
-    txn_b64 = route['swapTransaction']
-    txn_bytes = base64.b64decode(txn_b64)
-    txn = VersionedTransaction.deserialize(txn_bytes)
-    txn.sign([keypair])
-    sig = await client.send_raw_transaction(txn.serialize(), opts=TxOpts(skip_preflight=True))
-    await client.confirm_transaction(sig.value)
-    return sig.value
-
-async def execute_buy(mint):
-    input_mint = WRAPPED_SOL
-    amount = int(BUY_AMOUNT_SOL * 1_000_000_000)
-    try:
-        async with AsyncClient(RPC_URL) as client:
-            logging.info(f"Attempting to buy token {mint} for {BUY_AMOUNT_SOL} SOL...")
-            route = await get_swap_route(input_mint, mint, amount, SLIPPAGE)
-            sig = await execute_swap(route, client)
-        return True, sig
-    except Exception as e:
-        logging.error(f"execute_buy failed for {mint}: {e}\n{traceback.format_exc()}")
-        return False, None
-
-# --- TELEGRAM ---
-async def send_telegram_message(message):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": True
-    }
-    async with aiohttp.ClientSession() as session:
-        try:
-            await session.post(url, json=payload, timeout=10)
-        except Exception as e:
-            logging.error(f"Telegram error: {e}")
-
-# --- TOKEN FILTERING ---
-def is_token_eligible(token):
-    mint = token.get("mint")
-    if not mint or mint == WRAPPED_SOL:
-        return False, "Invalid or native SOL mint"
-    return True, ""
-
-# --- MAIN LOOP ---
+# --- Main Async Batch Processing ---
 async def main():
-    tokens = await fetch_recent_tokens(limit=10)
-    logging.info(f"Recent token mints: {[t['mint'] for t in tokens]}")
-    for token in tokens:
-        mint = token.get("mint")
-        eligible, reason = is_token_eligible(token)
-        if eligible:
-            has_pool = await has_liquidity(mint)
-            if not has_pool:
-                logging.info(f"Skipped token {mint}: No liquidity pool found.")
-                continue
-            success, sig = await execute_buy(mint)
-            if success:
-                await send_telegram_message(f"✅ Bought {mint}\nTx: {sig}")
+    token_mints = fetch_recent_token_mints()
+    results = []
+    timeout_count = 0
+    success_count = 0
+
+    for token in token_mints:
+        has_liq = await has_liquidity(token)
+        results.append((token, has_liq))
+        if has_liq:
+            success_count += 1
         else:
-            logging.info(f"Skipped token {mint}: {reason}")
-        await asyncio.sleep(1)
+            timeout_count += 1
+
+    log_with_context(
+        logging.INFO,
+        "Batch summary",
+        total_tokens=len(token_mints),
+        with_liquidity=success_count,
+        without_liquidity=timeout_count
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())
