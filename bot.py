@@ -61,12 +61,21 @@ def get_token_mints_from_tx(signature):
         result = response.json()
         print(f"DEBUG: getTransaction result for {signature}:", result)  # Debug print
         tx = result.get("result", {}).get("transaction", {})
+        meta = result.get("result", {}).get("meta", {})
         mints = set()
+
+        # 1. Extract from preTokenBalances and postTokenBalances
+        for bal in meta.get("preTokenBalances", []) + meta.get("postTokenBalances", []):
+            if "mint" in bal:
+                mints.add(bal["mint"])
+
+        # 2. Still try to extract from instructions as before
         for instr in tx.get("message", {}).get("instructions", []):
             if "parsed" in instr and "info" in instr["parsed"]:
                 info = instr["parsed"]["info"]
                 if "mint" in info:
                     mints.add(info["mint"])
+
         return list(mints)
     except Exception as e:
         print(f"DEBUG: Exception in get_token_mints_from_tx for {signature}:", e)
