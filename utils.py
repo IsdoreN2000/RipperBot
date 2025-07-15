@@ -1,3 +1,4 @@
+import os
 import time
 import requests
 import logging
@@ -5,7 +6,9 @@ import logging
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
 HELIUS_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 PUMP_PROGRAM_ID = "C5pN1p7tMUT9gCgQPxz2CcsiLzgyWTu1S5Gu1w1pMxEz"
+JUPITER_API_URL = "https://quote-api.jup.ag/v1/quote"
 
+# Fetch recent token mints from the Helius API
 def fetch_recent_token_mints(limit=20):
     try:
         payload = {
@@ -16,45 +19,19 @@ def fetch_recent_token_mints(limit=20):
         }
         response = requests.post(HELIUS_URL, json=payload)
         response.raise_for_status()
-        tx_signatures = [tx["signature"] for tx in response.json().get("result", [])]
+        result = response.json()
+        return [tx["signature"] for tx in result.get("result", [])]
     except Exception as e:
-        logging.warning(f"Failed to fetch signatures: {e}")
+        logging.warning(f"Failed to fetch recent token mints: {e}")
         return []
 
-    mint_addresses = []
+# Utility function to check if a token mint is valid
+def is_valid_mint(token_data):
+    if not token_data:
+        return False
+    try:
+        return token_data.get("decimals", 0) > 0
+    except Exception:
+        return False
 
-    for signature in tx_signatures:
-        try:
-            tx_payload = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "getTransaction",
-                "params": [signature, {
-                    "encoding": "jsonParsed",
-                    "maxSupportedTransactionVersion": 0
-                }]
-            }
-            tx_resp = requests.post(HELIUS_URL, json=tx_payload)
-            tx_resp.raise_for_status()
-            result = tx_resp.json().get("result", {})
-
-            # Check token age
-            block_time = result.get("blockTime")
-            if not block_time:
-                continue
-            age_seconds = time.time() - block_time
-            if age_seconds < 180:
-                continue
-
-            # Extract mint from postTokenBalances
-            post_token_balances = result.get("meta", {}).get("postTokenBalances", [])
-            for token in post_token_balances:
-                mint = token.get("mint")
-                if mint and mint not in mint_addresses:
-                    mint_addresses.append(mint)
-
-        except Exception as e:
-            logging.warning(f"Failed to parse tx {signature}: {e}")
-            continue
-
-    return mint_addresses
+# Add other utility functions as needed here...
