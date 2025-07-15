@@ -7,7 +7,7 @@ import requests
 
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
 HELIUS_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
-PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+PUMP_PROGRAM_ID = "C5pN1p7tMUT9gCgQPxz2CcsiLzgyWTu1S5Gu1w1pMxEz" 
 JUPITER_API_URL = "https://quote-api.jup.ag/v1/quote"
 
 MIN_TOKEN_AGE_SECONDS = 40
