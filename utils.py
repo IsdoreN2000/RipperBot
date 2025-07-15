@@ -13,6 +13,8 @@ import requests
 
 logging.basicConfig(level=logging.INFO)
 
+print("Script started")  # Confirm script is running
+
 # Load environment variables
 RPC_URL = os.getenv("RPC_URL", "https://mainnet.helius-rpc.com/?api-key=" + os.getenv("HELIUS_API_KEY"))
 PRIVATE_KEY = json.loads(os.getenv("PRIVATE_KEY"))
@@ -42,6 +44,7 @@ def get_recent_signatures(limit=20):
         print("DEBUG: getSignaturesForAddress result:", result)  # Debug print
         return [tx["signature"] for tx in result.get("result", [])]
     except Exception as e:
+        print("DEBUG: Exception in get_recent_signatures:", e)
         logging.warning(f"Failed to fetch signatures: {e}")
         return []
 
@@ -66,15 +69,22 @@ def get_token_mints_from_tx(signature):
                     mints.add(info["mint"])
         return list(mints)
     except Exception as e:
+        print(f"DEBUG: Exception in get_token_mints_from_tx for {signature}:", e)
         logging.warning(f"Failed to parse tx {signature}: {e}")
         return []
 
 async def fetch_recent_tokens(limit=20):
     signatures = get_recent_signatures(limit)
+    if not signatures:
+        print("DEBUG: No signatures found from get_recent_signatures.")
     all_mints = set()
     for sig in signatures:
         mints = get_token_mints_from_tx(sig)
+        if not mints:
+            print(f"DEBUG: No mints found in transaction {sig}.")
         all_mints.update(mints)
+    if not all_mints:
+        print("DEBUG: No mints found from any transaction.")
     return [{"mint": mint} for mint in all_mints]
 
 # === BUYING & SELLING ===
