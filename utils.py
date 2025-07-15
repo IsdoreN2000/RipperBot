@@ -8,8 +8,8 @@ from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.types import TxOpts
+import asyncio
 
-# --- Configuration ---
 logging.basicConfig(level=logging.INFO)
 RPC_URL = os.getenv("RPC_URL", "https://api.mainnet-beta.solana.com")
 
@@ -23,7 +23,6 @@ BUY_AMOUNT_SOL = float(os.getenv("BUY_AMOUNT_SOL", 0.1))
 SLIPPAGE = float(os.getenv("SLIPPAGE", 3))
 JUPITER_API_URL = "https://quote-api.jup.ag/v1/quote"
 
-# --- Fetch recent tokens (utility, optional) ---
 async def fetch_recent_tokens():
     url = "https://api.pump.fun/tokens?sort=recent"
     async with aiohttp.ClientSession() as session:
@@ -40,12 +39,8 @@ async def fetch_recent_tokens():
             logging.error(f"Error fetching tokens: {e}")
             return []
 
-# --- Token eligibility filter (utility, optional) ---
 def is_token_eligible(token):
     try:
-        # Log the type and content of token for debugging
-        logging.info(f"Token type: {type(token)}; token: {token}")
-
         age = datetime.now(timezone.utc).timestamp() - int(token.get("timestamp", 0))
         liquidity = float(token.get("liquidity", 0))
         holders = int(token.get("uniqueHolders", 0))
@@ -57,22 +52,15 @@ def is_token_eligible(token):
         )
 
         if age < 1 or age > 180:
-            logging.info("Filter reject: Token age not within 1s to 3min range")
-            return False, "Token age not within 1s to 3min range"
+            return False, "Age not in range"
         if liquidity < 0.3:
-            logging.info("Filter reject: Low liquidity")
             return False, "Low liquidity"
         if holders < 2:
-            logging.info("Filter reject: Not enough holders")
-            return False, "Not enough holders"
-
-        logging.info("Token passed filters")
+            return False, "Too few holders"
         return True, ""
     except Exception as e:
-        logging.error(f"Filter error: {e}")
-        return False, f"Error in filter: {e}"
+        return False, str(e)
 
-# --- Get swap route from Jupiter ---
 async def get_swap_route(input_mint, output_mint, amount, slippage=3):
     params = {
         "inputMint": input_mint,
@@ -84,14 +72,13 @@ async def get_swap_route(input_mint, output_mint, amount, slippage=3):
     async with aiohttp.ClientSession() as session:
         async with session.get(JUPITER_API_URL, params=params, timeout=10) as resp:
             if resp.status != 200:
-                raise Exception(f"Jupiter API error: {resp.status}")
+                raise Exception(f"Jupiter error: {resp.status}")
             data = await resp.json()
             routes = data.get("data")
             if not routes or "swapTransaction" not in routes[0]:
-                raise Exception("No swap routes found or missing swapTransaction")
+                raise Exception("No route or swapTransaction found")
             return routes[0]
 
-# --- Execute swap transaction ---
 async def execute_swap(route, client):
     txn_b64 = route['swapTransaction']
     txn_bytes = base64.b64decode(txn_b64)
@@ -101,48 +88,38 @@ async def execute_swap(route, client):
     await client.confirm_transaction(sig.value)
     return sig.value
 
-# --- Execute buy using Jupiter ---
 async def execute_buy(mint, amount_usd=None):
-    input_mint = "So11111111111111111111111111111111111111112"  # Wrapped SOL
+    input_mint = "So11111111111111111111111111111111111111112"
     output_mint = mint
-    amount = int(BUY_AMOUNT_SOL * 1_000_000_000)  # 1 SOL = 1_000_000_000 lamports
+    amount = int(BUY_AMOUNT_SOL * 1_000_000_000)
     async with AsyncClient(RPC_URL) as client:
         route = await get_swap_route(input_mint, output_mint, amount, SLIPPAGE)
         sig = await execute_swap(route, client)
     return True, sig
 
-# --- Execute sell using Jupiter ---
 async def execute_sell(mint, multiplier=2.0):
     input_mint = mint
-    output_mint = "So11111111111111111111111111111111111111112"  # Wrapped SOL
+    output_mint = "So11111111111111111111111111111111111111112"
     amount = int(BUY_AMOUNT_SOL * multiplier * 1_000_000_000)
     async with AsyncClient(RPC_URL) as client:
         route = await get_swap_route(input_mint, output_mint, amount, SLIPPAGE)
         sig = await execute_swap(route, client)
     return True, sig
 
-# --- Get token price ---
 async def get_token_price(mint: str) -> float:
-    """
-    Fetch the current price of a token by its mint address.
-    Replace the URL and parsing logic with your actual price API.
-    """
-    url = f"https://api.pump.fun/price/{mint}"  # Example endpoint, replace as needed
+    url = f"https://api.pump.fun/price/{mint}"
     async with aiohttp.ClientSession() as session:
         async with session.get(url, timeout=10) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                # Adjust this line to match the actual response structure
                 return float(data.get("price", 0))
             else:
-                raise Exception(f"Failed to fetch price for {mint}: HTTP {resp.status}")
+                raise Exception(f"Price fetch failed for {mint}: {resp.status}")
 
-# --- Telegram notification ---
 async def send_telegram_message(message):
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
-        logging.warning("Telegram credentials not set.")
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
@@ -155,27 +132,23 @@ async def send_telegram_message(message):
         try:
             await session.post(url, json=payload, timeout=10)
         except Exception as e:
-            logging.error(f"Error sending Telegram message: {e}")
+            logging.error(f"Telegram error: {e}")
 
-# --- Example main loop (for illustration) ---
 async def main():
     tokens = await fetch_recent_tokens()
     for token in tokens:
-        # Always use .get() for dictionary access, never .name
-        token_name = token.get("name", "unknown")
-        logging.info(f"Processing token: {token_name}")
+        name = token.get("name", "unknown")
         eligible, reason = is_token_eligible(token)
         if eligible:
-            logging.info(f"Token {token_name} is eligible, attempting buy.")
             try:
                 success, sig = await execute_buy(token.get("mint"))
                 if success:
-                    await send_telegram_message(f"Bought token {token_name} ({token.get('mint')})\nTx: {sig}")
+                    await send_telegram_message(f"Bought {name} ({token.get('mint')})\nTx: {sig}")
             except Exception as e:
-                logging.error(f"Buy failed for {token_name}: {e}")
+                logging.error(f"Buy failed for {name}: {e}")
         else:
-            logging.info(f"Token {token_name} not eligible: {reason}")
+            logging.info(f"{name} not eligible: {reason}")
+        await asyncio.sleep(1)  # Optional: avoid rate limits
 
-# To run the main loop, use:
-# import asyncio
-# asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
