@@ -96,7 +96,7 @@ async def has_liquidity(mint):
         "inputMint": WRAPPED_SOL,
         "outputMint": mint,
         "amount": str(int(BUY_AMOUNT_SOL * 1_000_000_000)),
-        "slippageBps": int(SLIPPAGE * 100),  # v6 expects bps
+        "slippageBps": int(SLIPPAGE * 100),
         "onlyDirectRoutes": "true"
     }
     try:
@@ -161,19 +161,21 @@ async def execute_swap(swap_txn_b64, client):
     await client.confirm_transaction(sig.value)
     return sig.value
 
-async def execute_buy(mint):
+async def execute_buy(mint, max_retries=3):
     input_mint = WRAPPED_SOL
     amount = int(BUY_AMOUNT_SOL * 1_000_000_000)
-    try:
-        async with AsyncClient(RPC_URL) as client:
-            logging.info(f"Attempting to buy token {mint} for {BUY_AMOUNT_SOL} SOL...")
-            route = await get_swap_route(input_mint, mint, amount, SLIPPAGE)
-            swap_txn_b64 = await get_swap_transaction(route, str(keypair.pubkey()))
-            sig = await execute_swap(swap_txn_b64, client)
-        return True, sig
-    except Exception as e:
-        logging.error(f"execute_buy failed for {mint}: {e}\n{traceback.format_exc()}")
-        return False, None
+    for attempt in range(max_retries):
+        try:
+            async with AsyncClient(RPC_URL) as client:
+                logging.info(f"Attempting to buy token {mint} for {BUY_AMOUNT_SOL} SOL...")
+                route = await get_swap_route(input_mint, mint, amount, SLIPPAGE)
+                swap_txn_b64 = await get_swap_transaction(route, str(keypair.pubkey()))
+                sig = await execute_swap(swap_txn_b64, client)
+            return True, sig
+        except Exception as e:
+            logging.warning(f"Attempt {attempt+1} failed for {mint}: {e}")
+            await asyncio.sleep(2 * (attempt + 1))
+    return False, None
 
 # --- TELEGRAM ---
 async def send_telegram_message(message):
