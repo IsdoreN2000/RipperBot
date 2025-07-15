@@ -3,7 +3,7 @@ import json
 import base64
 import aiohttp
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
 from solana.rpc.async_api import AsyncClient
@@ -13,9 +13,9 @@ import requests
 
 logging.basicConfig(level=logging.INFO)
 
-print("=== BOT.PY STARTED ===")
+print("=== BOT.PY STARTED ===")  # Confirm script is running
 
-# === ENVIRONMENT VARIABLES ===
+# Load environment variables
 RPC_URL = os.getenv("RPC_URL", "https://mainnet.helius-rpc.com/?api-key=" + os.getenv("HELIUS_API_KEY"))
 PRIVATE_KEY = json.loads(os.getenv("PRIVATE_KEY"))
 keypair = Keypair.from_bytes(bytes(PRIVATE_KEY))
@@ -29,7 +29,7 @@ HELIUS_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 JUPITER_API_URL = "https://quote-api.jup.ag/v1/quote"
 
-# === HELIUS ===
+# === HELIUS TX FETCHING ===
 def get_recent_signatures(limit=10):
     payload = {
         "jsonrpc": "2.0",
@@ -41,8 +41,10 @@ def get_recent_signatures(limit=10):
         response = requests.post(HELIUS_URL, json=payload)
         response.raise_for_status()
         result = response.json()
+        print("DEBUG: getSignaturesForAddress result:", result)
         return [tx["signature"] for tx in result.get("result", [])]
     except Exception as e:
+        print("DEBUG: Exception in get_recent_signatures:", e)
         logging.warning(f"Failed to fetch signatures: {e}")
         return []
 
@@ -51,18 +53,13 @@ def get_token_mints_from_tx(signature):
         "jsonrpc": "2.0",
         "id": 1,
         "method": "getTransaction",
-        "params": [signature, {
-            "encoding": "jsonParsed",
-            "maxSupportedTransactionVersion": 0  # FIXED: To support v0 tx
-        }]
+        "params": [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
     }
     try:
         response = requests.post(HELIUS_URL, json=payload)
+        response.raise_for_status()
         result = response.json()
-        if "error" in result:
-            logging.debug(f"Error in getTransaction for {signature}: {result['error']}")
-            return []
-
+        print(f"DEBUG: getTransaction result for {signature}:", result)
         tx = result.get("result", {}).get("transaction", {})
         meta = result.get("result", {}).get("meta", {})
         mints = set()
@@ -86,41 +83,45 @@ def get_token_mints_from_tx(signature):
 
         return list(mints)
     except Exception as e:
+        print(f"DEBUG: Exception in get_token_mints_from_tx for {signature}:", e)
         logging.warning(f"Failed to parse tx {signature}: {e}")
         return []
 
 async def fetch_recent_tokens(limit=10):
     signatures = get_recent_signatures(limit)
+    if not signatures:
+        print("DEBUG: No signatures found from get_recent_signatures.")
     all_mints = set()
     for sig in signatures:
         mints = get_token_mints_from_tx(sig)
+        if not mints:
+            print(f"DEBUG: No mints found in transaction {sig}.")
         all_mints.update(mints)
+    if not all_mints:
+        print("DEBUG: No mints found from any transaction.")
     return [{"mint": mint} for mint in all_mints]
 
-# === JUPITER ===
+# === BUYING & SELLING ===
 async def get_swap_route(input_mint, output_mint, amount, slippage=3):
     params = {
         "inputMint": input_mint,
         "outputMint": output_mint,
         "amount": str(amount),
         "slippage": str(slippage),
-        "onlyDirectRoutes": "true"
+        "onlyDirectRoutes": "false"  # <-- changed
     }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(JUPITER_API_URL, params=params, timeout=10) as resp:
-                data = await resp.json()
-                routes = data.get("data", [])
-                if not routes or "swapTransaction" not in routes[0]:
-                    raise Exception("No swap route found")
-                return routes[0]
-    except asyncio.TimeoutError:
-        raise Exception("Jupiter API timeout")
-    except Exception as e:
-        raise Exception(f"Jupiter error: {e}")
+    async with aiohttp.ClientSession() as session:
+        async with session.get(JUPITER_API_URL, params=params, timeout=30) as resp:  # <-- timeout increased
+            if resp.status != 200:
+                raise Exception(f"Jupiter error: {resp.status}")
+            data = await resp.json()
+            routes = data.get("data")
+            if not routes or "swapTransaction" not in routes[0]:
+                raise Exception("No route or swapTransaction found")
+            return routes[0]
 
 async def execute_swap(route, client):
-    txn_b64 = route["swapTransaction"]
+    txn_b64 = route['swapTransaction']
     txn_bytes = base64.b64decode(txn_b64)
     txn = VersionedTransaction.deserialize(txn_bytes)
     txn.sign([keypair])
@@ -139,36 +140,28 @@ async def execute_buy(mint, amount_usd=None):
         return True, sig
     except Exception as e:
         logging.error(f"execute_buy failed for {mint}: {e}")
-        return False, None
+        raise
 
 async def execute_sell(mint, multiplier=2.0):
     input_mint = mint
     output_mint = "So11111111111111111111111111111111111111112"
     amount = int(BUY_AMOUNT_SOL * multiplier * 1_000_000_000)
-    try:
-        async with AsyncClient(RPC_URL) as client:
-            route = await get_swap_route(input_mint, output_mint, amount, SLIPPAGE)
-            sig = await execute_swap(route, client)
-        return True, sig
-    except Exception as e:
-        logging.error(f"execute_sell failed for {mint}: {e}")
-        return False, None
+    async with AsyncClient(RPC_URL) as client:
+        route = await get_swap_route(input_mint, output_mint, amount, SLIPPAGE)
+        sig = await execute_swap(route, client)
+    return True, sig
 
-# === PUMP PRICE ===
 async def get_token_price(mint: str) -> float:
     url = f"https://api.pump.fun/price/{mint}"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=10) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return float(data.get("price", 0))
-                raise Exception(f"Price fetch failed with {resp.status}")
-    except Exception as e:
-        logging.warning(f"get_token_price error: {e}")
-        return 0.0
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, timeout=10) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                return float(data.get("price", 0))
+            else:
+                raise Exception(f"Price fetch failed for {mint}: {resp.status}")
 
-# === TELEGRAM ===
+# === TELEGRAM NOTIFICATIONS ===
 async def send_telegram_message(message):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         return
@@ -179,13 +172,13 @@ async def send_telegram_message(message):
         "parse_mode": "Markdown",
         "disable_web_page_preview": True
     }
-    try:
-        async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession() as session:
+        try:
             await session.post(url, json=payload, timeout=10)
-    except Exception as e:
-        logging.error(f"Telegram error: {e}")
+        except Exception as e:
+            logging.error(f"Telegram error: {e}")
 
-# === TOKEN FILTER ===
+# === TOKEN FILTERING ===
 def is_token_eligible(token):
     mint = token.get("mint")
     if not mint:
@@ -195,18 +188,20 @@ def is_token_eligible(token):
 # === MAIN LOOP ===
 async def main():
     tokens = await fetch_recent_tokens(limit=10)
-    logging.info(f"Found {len(tokens)} recent token(s)")
+    logging.info(f"Recent token mints: {[t['mint'] for t in tokens]}")
     for token in tokens:
         mint = token.get("mint", "unknown")
+        name = token.get("name", "unknown")
         eligible, reason = is_token_eligible(token)
         if eligible:
-            success, sig = await execute_buy(mint)
-            if success:
-                await send_telegram_message(f"✅ Bought token: `{mint}`\nTx: https://solscan.io/tx/{sig}")
-            else:
-                await send_telegram_message(f"❌ Failed to buy token: `{mint}`")
+            try:
+                success, sig = await execute_buy(mint)
+                if success:
+                    await send_telegram_message(f"✅ Bought {name} ({mint})\nTx: {sig}")
+            except Exception as e:
+                logging.error(f"Buy failed for {name} ({mint}): {e}")
         else:
-            logging.info(f"Skipped {mint}: {reason}")
+            logging.info(f"{name} not eligible: {reason}")
         await asyncio.sleep(1)
 
 if __name__ == "__main__":
