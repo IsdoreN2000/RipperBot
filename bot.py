@@ -69,12 +69,20 @@ def get_token_mints_from_tx(signature):
             if "mint" in bal:
                 mints.add(bal["mint"])
 
-        # 2. Still try to extract from instructions as before
+        # 2. Extract from top-level instructions
         for instr in tx.get("message", {}).get("instructions", []):
             if "parsed" in instr and "info" in instr["parsed"]:
                 info = instr["parsed"]["info"]
                 if "mint" in info:
                     mints.add(info["mint"])
+
+        # 3. Extract from innerInstructions
+        for inner in meta.get("innerInstructions", []):
+            for instr in inner.get("instructions", []):
+                if "parsed" in instr and "info" in instr["parsed"]:
+                    info = instr["parsed"]["info"]
+                    if "mint" in info:
+                        mints.add(info["mint"])
 
         return list(mints)
     except Exception as e:
@@ -128,10 +136,14 @@ async def execute_buy(mint, amount_usd=None):
     input_mint = "So11111111111111111111111111111111111111112"
     output_mint = mint
     amount = int(BUY_AMOUNT_SOL * 1_000_000_000)
-    async with AsyncClient(RPC_URL) as client:
-        route = await get_swap_route(input_mint, output_mint, amount, SLIPPAGE)
-        sig = await execute_swap(route, client)
-    return True, sig
+    try:
+        async with AsyncClient(RPC_URL) as client:
+            route = await get_swap_route(input_mint, output_mint, amount, SLIPPAGE)
+            sig = await execute_swap(route, client)
+        return True, sig
+    except Exception as e:
+        print(f"DEBUG: execute_buy failed for {mint}: {e}")
+        raise
 
 async def execute_sell(mint, multiplier=2.0):
     input_mint = mint
@@ -182,15 +194,16 @@ async def main():
     tokens = await fetch_recent_tokens(limit=10)
     logging.info(f"Recent token mints: {[t['mint'] for t in tokens]}")
     for token in tokens:
+        mint = token.get("mint", "unknown")
         name = token.get("name", "unknown")
         eligible, reason = is_token_eligible(token)
         if eligible:
             try:
-                success, sig = await execute_buy(token.get("mint"))
+                success, sig = await execute_buy(mint)
                 if success:
-                    await send_telegram_message(f"✅ Bought {name} ({token.get('mint')})\nTx: {sig}")
+                    await send_telegram_message(f"✅ Bought {name} ({mint})\nTx: {sig}")
             except Exception as e:
-                logging.error(f"Buy failed for {name}: {e}")
+                logging.error(f"Buy failed for {name} ({mint}): {e}")
         else:
             logging.info(f"{name} not eligible: {reason}")
         await asyncio.sleep(1)
