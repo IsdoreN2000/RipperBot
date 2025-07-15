@@ -21,7 +21,7 @@ async def get_token_mints_from_tx(signature, session, helius_url):
         "method": "getTransaction",
         "params": [signature, {
             "encoding": "jsonParsed",
-            "maxSupportedTransactionVersion": 0  # fixes error
+            "maxSupportedTransactionVersion": 0
         }]
     }
     try:
