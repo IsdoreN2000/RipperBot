@@ -150,9 +150,11 @@ async def has_liquidity(session, mint):
                 return False
             routes = data.get("data", [])
             if not routes:
+                logging.info(f"[has_liquidity] {mint} no routes found")
                 return False
             best_route = routes[0]
             out_amount = int(best_route.get("outAmount", 0))
+            logging.info(f"[has_liquidity] {mint} out_amount: {out_amount}")
             if out_amount < MIN_LIQUIDITY_LAMPORTS:
                 logging.info(f"[liquidity] {mint} liquidity {out_amount} too low (< 20 SOL)")
                 return False
@@ -257,7 +259,7 @@ async def check_for_sell(session, client):
             del positions[mint]
             save_positions(positions)
 
-# --- MAIN LOOP ---
+# --- MAIN LOOP WITH DEBUG LOGGING ---
 async def main_loop():
     async with aiohttp.ClientSession() as session:
         async with AsyncClient(RPC_URL) as client:
@@ -272,21 +274,33 @@ async def main_loop():
                         logging.info(f"[check] {mint}")
 
                         creation_time = await get_token_creation_time(session, mint)
+                        logging.info(f"[debug] {mint} creation_time: {creation_time}")
                         if not creation_time:
                             logging.info(f"[skip] {mint} has no block_time (API returned None)")
                             continue
 
                         now = int(datetime.now(timezone.utc).timestamp())
                         age = now - creation_time
+                        logging.info(f"[debug] {mint} age: {age}s")
 
                         if not (MIN_TOKEN_AGE_SECONDS <= age <= MAX_TOKEN_AGE_SECONDS):
                             logging.info(f"[skip] {mint} age: {age}s (outside 0-1h window)")
                             continue
 
-                        if await has_liquidity(session, mint):
-                            success, _ = await execute_buy(session, mint, client)
-                            if success:
-                                await asyncio.sleep(2)
+                        liquidity = await has_liquidity(session, mint)
+                        logging.info(f"[debug] {mint} liquidity: {liquidity}")
+                        if liquidity:
+                            try:
+                                success, _ = await execute_buy(session, mint, client)
+                                if success:
+                                    logging.info(f"[buy] {mint} bought successfully")
+                                    await asyncio.sleep(2)
+                                else:
+                                    logging.info(f"[buy] {mint} buy attempt failed")
+                            except Exception as buy_exc:
+                                logging.error(f"[buy] {mint} buy error: {buy_exc}")
+                        else:
+                            logging.info(f"[skip] {mint} insufficient liquidity")
                     await check_for_sell(session, client)
                     await asyncio.sleep(10)
                 except Exception as e:
