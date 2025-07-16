@@ -1,20 +1,22 @@
+# ... imports ...
 import os
 import json
 import base64
 import aiohttp
 import logging
+import asyncio
+import traceback
 from datetime import datetime, timezone
+
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.types import TxOpts
-import asyncio
-import traceback
 
 logging.basicConfig(level=logging.INFO)
 print("=== BOT.PY STARTED ===")
 
-# --- ENVIRONMENT VARIABLES ---
+# --- ENVIRONMENT ---
 RPC_URL = os.getenv("RPC_URL", "https://mainnet.helius-rpc.com/?api-key=" + os.getenv("HELIUS_API_KEY"))
 PRIVATE_KEY = json.loads(os.getenv("PRIVATE_KEY"))
 keypair = Keypair.from_bytes(bytes(PRIVATE_KEY))
@@ -29,45 +31,46 @@ JUPITER_QUOTE_URL = "https://quote-api.jup.ag/v6/quote"
 JUPITER_SWAP_URL = "https://quote-api.jup.ag/v6/swap"
 WRAPPED_SOL = "So11111111111111111111111111111111111111112"
 PROFIT_TARGET = float(os.getenv("PROFIT_TARGET", 1.5))
-STOP_LOSS = float(os.getenv("STOP_LOSS", 0.8))
-PRICE_CHECK_INTERVAL = int(os.getenv("PRICE_CHECK_INTERVAL", 30))
+STOP_LOSS = float(os.getenv("STOP_LOSS", 0.7))
 
-# Persistent record of bought tokens
-BOUGHT_TOKENS_FILE = "bought_tokens.json"
-try:
-    with open(BOUGHT_TOKENS_FILE, "r") as f:
-        BOUGHT_TOKENS = set(json.load(f))
-except:
-    BOUGHT_TOKENS = set()
+# --- TRACKER ---
+owned_tokens = {}
 
-# --- HELIUS TX FETCHING (ASYNC) ---
+# --- TELEGRAM ---
+async def send_telegram(message):
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}
+    try:
+        async with aiohttp.ClientSession() as s:
+            await s.post(url, json=data)
+    except Exception as e:
+        logging.error(f"[Telegram] {e}")
+
+# --- HELIUS SCAN ---
 async def get_recent_signatures(limit=10):
     payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getSignaturesForAddress",
+        "jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
         "params": [PUMP_PROGRAM_ID, {"limit": limit}]
     }
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(HELIUS_URL, json=payload, timeout=10) as resp:
-                result = await resp.json()
-                return [tx["signature"] for tx in result.get("result", [])]
+        async with aiohttp.ClientSession() as s:
+            async with s.post(HELIUS_URL, json=payload, timeout=10) as r:
+                return [tx["signature"] for tx in (await r.json()).get("result", [])]
     except Exception as e:
-        logging.warning(f"[get_recent_signatures] Failed to fetch signatures: {e}\n{traceback.format_exc()}")
+        logging.warning(f"[signatures] {e}")
         return []
 
 async def get_token_mints_from_tx(signature):
     payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getTransaction",
+        "jsonrpc": "2.0", "id": 1, "method": "getTransaction",
         "params": [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
     }
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(HELIUS_URL, json=payload, timeout=10) as resp:
-                result = await resp.json()
+        async with aiohttp.ClientSession() as s:
+            async with s.post(HELIUS_URL, json=payload, timeout=10) as r:
+                result = await r.json()
                 meta = result.get("result", {}).get("meta", {})
                 tx = result.get("result", {}).get("transaction", {})
                 mints = set()
@@ -76,53 +79,89 @@ async def get_token_mints_from_tx(signature):
                     if "mint" in bal:
                         mints.add(bal["mint"])
 
-                for instr in tx.get("message", {}).get("instructions", []):
-                    if "parsed" in instr and "info" in instr["parsed"]:
-                        if "mint" in instr["parsed"]["info"]:
-                            mints.add(instr["parsed"]["info"]["mint"])
-
-                for inner in meta.get("innerInstructions", []):
-                    for instr in inner.get("instructions", []):
-                        if "parsed" in instr and "info" in instr["parsed"]:
-                            if "mint" in instr["parsed"]["info"]:
-                                mints.add(instr["parsed"]["info"]["mint"])
-
-                logging.info(f"[get_token_mints_from_tx] Mints from {signature}: {mints}")
                 return list(mints)
     except Exception as e:
-        logging.warning(f"[get_token_mints_from_tx] Failed to parse tx {signature}: {e}\n{traceback.format_exc()}")
+        logging.warning(f"[mints] {e}")
         return []
 
-# [rest of code remains unchanged]
+async def fetch_recent_tokens(limit=10):
+    sigs = await get_recent_signatures(limit)
+    mints = set()
+    for sig in sigs:
+        mints.update(await get_token_mints_from_tx(sig))
+    return [{"mint": m} for m in mints if m != WRAPPED_SOL]
 
-# --- MAIN LOOP ---
-async def main():
-    tokens = await fetch_recent_tokens(limit=10)
-    logging.info(f"[main] Recent token mints: {[t['mint'] for t in tokens]}")
-    for token in tokens:
-        mint = token.get("mint")
-        eligible, reason = is_token_eligible(token)
+# --- JUPITER ---
+async def has_liquidity(mint):
+    params = {
+        "inputMint": WRAPPED_SOL, "outputMint": mint,
+        "amount": str(int(BUY_AMOUNT_SOL * 1_000_000_000)),
+        "slippageBps": int(SLIPPAGE * 100),
+        "onlyDirectRoutes": "true"
+    }
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(JUPITER_QUOTE_URL, params=params) as r:
+                data = await r.json()
+                if r.status != 200 or not data.get("data"):
+                    logging.warning(f"[has_liquidity] Error {r.status}: {data}")
+                    return False
+                return True
+    except Exception as e:
+        logging.warning(f"[has_liquidity] {e}")
+        return False
 
-        if not eligible:
-            logging.info(f"[main] Skipped token {mint}: {reason}")
+async def get_swap_route(input_mint, output_mint, amount):
+    params = {
+        "inputMint": input_mint, "outputMint": output_mint,
+        "amount": str(amount),
+        "slippageBps": int(SLIPPAGE * 100),
+        "onlyDirectRoutes": "true"
+    }
+    async with aiohttp.ClientSession() as s:
+        async with s.get(JUPITER_QUOTE_URL, params=params) as r:
+            data = await r.json()
+            return data["data"][0] if data.get("data") else None
+
+async def get_swap_tx(route, user_pubkey):
+    payload = {
+        "route": route, "userPublicKey": user_pubkey,
+        "wrapUnwrapSOL": True, "asLegacyTransaction": False
+    }
+    async with aiohttp.ClientSession() as s:
+        async with s.post(JUPITER_SWAP_URL, json=payload) as r:
+            data = await r.json()
+            return data["swapTransaction"]
+
+async def execute_swap(txn_b64, client):
+    txn = VersionedTransaction.deserialize(base64.b64decode(txn_b64))
+    txn.sign([keypair])
+    sig = await client.send_raw_transaction(txn.serialize(), opts=TxOpts(skip_preflight=True))
+    await client.confirm_transaction(sig.value)
+    return sig.value
+
+# --- BUY ---
+async def execute_buy(mint):
+    amount = int(BUY_AMOUNT_SOL * 1_000_000_000)
+    async with AsyncClient(RPC_URL) as client:
+        route = await get_swap_route(WRAPPED_SOL, mint, amount)
+        if not route:
+            return False, None
+        tx = await get_swap_tx(route, str(keypair.pubkey()))
+        sig = await execute_swap(tx, client)
+        owned_tokens[mint] = {"bought_at": float(route["outAmount"]) / 10**route["outputMintDecimals"]}
+        return True, sig
+
+# --- SELL ---
+async def check_and_sell():
+    if not owned_tokens:
+        return
+    for mint, info in list(owned_tokens.items()):
+        input_mint = mint
+        output_mint = WRAPPED_SOL
+        amount = int(info["bought_at"] * 10**6)  # rough estimate
+        route = await get_swap_route(input_mint, output_mint, amount)
+        if not route:
             continue
-
-        if mint in BOUGHT_TOKENS:
-            logging.info(f"[main] Skipped token {mint}: Already bought.")
-            continue
-
-        has_pool = await has_liquidity(mint)
-        if not has_pool:
-            logging.info(f"[main] Skipped token {mint}: No liquidity pool found.")
-            continue
-
-        success, sig = await execute_buy(mint)
-        if success:
-            BOUGHT_TOKENS.add(mint)
-            with open(BOUGHT_TOKENS_FILE, "w") as f:
-                json.dump(list(BOUGHT_TOKENS), f)
-            await send_telegram_message(f"✅ Bought {mint}\nTx: {sig}")
-
-        await asyncio.sleep(1)
-
-# [main_loop stays unchanged, as well as the rest of the script]
+        price_now = float(route["outAmount"]) / 10**route["outputMintDecimals"]
+        price_in = in_
