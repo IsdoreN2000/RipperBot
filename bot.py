@@ -16,7 +16,8 @@ import traceback
 logging.basicConfig(level=logging.INFO)
 logging.info("=== Bot started successfully ===")
 
-MIN_TOKEN_AGE_SECONDS = 30 * 60  # 30 minutes
+MIN_TOKEN_AGE_SECONDS = 0         # Minimum age: 0 seconds (just listed)
+MAX_TOKEN_AGE_SECONDS = 3600      # Maximum age: 1 hour (3600 seconds)
 MIN_LIQUIDITY_LAMPORTS = 20 * 1_000_000_000  # 20 SOL
 
 # --- ENVIRONMENT VARIABLES & VALIDATION ---
@@ -161,6 +162,7 @@ async def has_liquidity(session, mint):
         return False
 
 async def get_token_creation_time(session, mint):
+    # 1. Try getAccountInfo
     payload = {
         "jsonrpc": "2.0", "id": 1, "method": "getAccountInfo",
         "params": [mint, {"encoding": "jsonParsed"}]
@@ -168,13 +170,34 @@ async def get_token_creation_time(session, mint):
     try:
         async with session.post(HELIUS_URL, json=payload, timeout=10) as resp:
             result = await resp.json()
-            slot = result.get("result", {}).get("context", {}).get("slot", 0)
-            if not slot:
-                return None
-            return datetime.now(timezone.utc).timestamp()  # fallback
+            block_time = result.get("result", {}).get("value", {}).get("blockTime")
+            if block_time:
+                return block_time
     except Exception as e:
-        logging.warning(f"[token_time] {e}")
-        return None
+        logging.warning(f"[token_time] primary failed: {e}")
+
+    # 2. Fallback: get first signature, then getBlockTime from slot
+    payload = {
+        "jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
+        "params": [mint, {"limit": 1}]
+    }
+    try:
+        async with session.post(HELIUS_URL, json=payload, timeout=10) as resp:
+            data = await resp.json()
+            sigs = data.get("result", [])
+            if sigs:
+                slot = sigs[0].get("slot")
+                if slot:
+                    block_time_payload = {
+                        "jsonrpc": "2.0", "id": 1, "method": "getBlockTime", "params": [slot]
+                    }
+                    async with session.post(HELIUS_URL, json=block_time_payload, timeout=10) as r:
+                        block_data = await r.json()
+                        return block_data.get("result")
+    except Exception as e:
+        logging.warning(f"[token_time fallback] {e}")
+
+    return None
 
 async def get_swap_route(session, input_mint, output_mint, amount):
     params = {
@@ -249,11 +272,16 @@ async def main_loop():
                         logging.info(f"[check] {mint}")
 
                         creation_time = await get_token_creation_time(session, mint)
-                        if creation_time:
-                            age = datetime.now(timezone.utc).timestamp() - creation_time
-                            if age < MIN_TOKEN_AGE_SECONDS:
-                                logging.info(f"[skip] {mint} too new ({int(age)}s)")
-                                continue
+                        if not creation_time:
+                            logging.info(f"[skip] {mint} has no block_time (API returned None)")
+                            continue
+
+                        now = int(datetime.now(timezone.utc).timestamp())
+                        age = now - creation_time
+
+                        if not (MIN_TOKEN_AGE_SECONDS <= age <= MAX_TOKEN_AGE_SECONDS):
+                            logging.info(f"[skip] {mint} age: {age}s (outside 0-1h window)")
+                            continue
 
                         if await has_liquidity(session, mint):
                             success, _ = await execute_buy(session, mint, client)
