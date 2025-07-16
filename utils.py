@@ -160,7 +160,9 @@ async def has_liquidity(session, mint):
         logging.warning(f"[has_liquidity] {e}")
         return False
 
+# --- REAL TOKEN CREATION TIME LOGIC ---
 async def get_token_creation_time(session, mint):
+    # Step 1: Get account info to find the slot
     payload = {
         "jsonrpc": "2.0", "id": 1, "method": "getAccountInfo",
         "params": [mint, {"encoding": "jsonParsed"}]
@@ -171,9 +173,25 @@ async def get_token_creation_time(session, mint):
             slot = result.get("result", {}).get("context", {}).get("slot", 0)
             if not slot:
                 return None
-            return datetime.now(timezone.utc).timestamp()  # fallback
     except Exception as e:
         logging.warning(f"[token_time] {e}")
+        return None
+
+    # Step 2: Get block time for that slot
+    payload = {
+        "jsonrpc": "2.0", "id": 1, "method": "getBlockTime",
+        "params": [slot]
+    }
+    try:
+        async with session.post(HELIUS_URL, json=payload, timeout=10) as resp:
+            result = await resp.json()
+            block_time = result.get("result", None)
+            if block_time is not None:
+                return float(block_time)
+            else:
+                return None
+    except Exception as e:
+        logging.warning(f"[block_time] {e}")
         return None
 
 async def get_swap_route(session, input_mint, output_mint, amount):
@@ -281,12 +299,3 @@ if __name__ == "__main__":
     finally:
         save_positions(positions)
         loop.close()
-
-Key change:
-In the main loop, this block now only skips tokens older than 30 minutes:
-
-if creation_time:
-    age = datetime.now(timezone.utc).timestamp() - creation_time
-    if age > MIN_TOKEN_AGE_SECONDS:
-        logging.info(f"[skip] {mint} too old ({int(age)}s)")
-        continue
