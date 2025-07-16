@@ -16,7 +16,7 @@ import traceback
 logging.basicConfig(level=logging.INFO)
 logging.info("=== Bot started successfully ===")
 
-# --- ENVIRONMENT VARIABLES & VALIDATION ---
+# --- CONFIG ---
 REQUIRED_ENVS = [
     "PRIVATE_KEY", "HELIUS_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"
 ]
@@ -40,15 +40,16 @@ PROFIT_TARGET = float(os.getenv("PROFIT_TARGET", 1.5))
 STOP_LOSS = float(os.getenv("STOP_LOSS", 0.7))
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
 HELIUS_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+WRAPPED_SOL = "So11111111111111111111111111111111111111112"
 JUPITER_QUOTE_URL = "https://quote-api.jup.ag/v6/quote"
 JUPITER_SWAP_URL = "https://quote-api.jup.ag/v6/swap"
-WRAPPED_SOL = "So11111111111111111111111111111111111111112"
 POSITIONS_FILE = "positions.json"
-MAX_TOKEN_AGE_SECONDS = 1800  # 30 minutes
+MAX_TOKEN_AGE_SECONDS = 30 * 60  # 30 minutes
 
-# --- POSITION PERSISTENCE ---
+# --- POSITION STORAGE ---
 def load_positions():
     if os.path.exists(POSITIONS_FILE):
         try:
@@ -134,6 +135,23 @@ async def fetch_recent_tokens(limit=10):
         all_mints.update(mints)
     return [{"mint": mint} for mint in all_mints if mint != WRAPPED_SOL]
 
+async def get_token_creation_time(mint):
+    payload = {
+        "jsonrpc": "2.0", "id": 1, "method": "getAccountInfo",
+        "params": [mint, {"encoding": "jsonParsed"}]
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(HELIUS_URL, json=payload, timeout=10) as resp:
+                data = await resp.json()
+                block_time = data.get("result", {}).get("value", {}).get("blockTime")
+                if block_time is None:
+                    return None
+                return block_time
+    except Exception as e:
+        logging.warning(f"[get_token_creation_time] {e}")
+        return None
+
 async def has_liquidity(mint):
     params = {
         "inputMint": WRAPPED_SOL,
@@ -187,7 +205,7 @@ async def execute_swap(swap_txn_b64, client):
     await client.confirm_transaction(sig.value)
     return sig.value
 
-# --- BUY/SELL LOGIC ---
+# --- BUY / SELL LOGIC ---
 async def execute_buy(mint, client):
     route = await get_swap_route(WRAPPED_SOL, mint, int(BUY_AMOUNT_SOL * 1_000_000_000))
     if not route:
@@ -214,29 +232,6 @@ async def check_for_sell(client):
             del positions[mint]
             save_positions(positions)
 
-# --- GET TOKEN CREATION TIME ---
-async def get_token_creation_time(mint):
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getSignaturesForAddress",
-        "params": [mint, {"limit": 1}]
-    }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(HELIUS_URL, json=payload, timeout=10) as resp:
-                result = await resp.json()
-                sigs = result.get("result", [])
-                if sigs:
-                    block_time = sigs[0].get("blockTime")
-                    if block_time is None:
-                        logging.info(f"[warn] {mint} has null blockTime, assuming 0s age")
-                        return datetime.now(timezone.utc).timestamp()
-                    return float(block_time)
-    except Exception as e:
-        logging.warning(f"[creation_time] {e}")
-    return None
-
 # --- MAIN LOOP ---
 async def main_loop():
     async with AsyncClient(RPC_URL) as client:
@@ -251,12 +246,22 @@ async def main_loop():
                     logging.info(f"[check] {mint}")
 
                     creation_time = await get_token_creation_time(mint)
-                    if creation_time:
-                        age = datetime.now(timezone.utc).timestamp() - creation_time
-                        logging.info(f"[age] {mint} is {int(age // 60)}m {int(age % 60)}s old")
-                        if age > MAX_TOKEN_AGE_SECONDS:
-                            logging.info(f"[skip] {mint} too old ({int(age)}s)")
-                            continue
+                    if creation_time is None:
+                        logging.info(f"[skip] {mint} missing blockTime")
+                        continue
+
+                    age = datetime.now(timezone.utc).timestamp() - creation_time
+                    age_minutes = round(age / 60, 2)
+
+                    if age > MAX_TOKEN_AGE_SECONDS:
+                        logging.info(f"[skip] {mint} too old ({age_minutes} min)")
+                        continue
+
+                    if age < 0:
+                        logging.info(f"[skip] {mint} has invalid negative age ({age_minutes} min)")
+                        continue
+
+                    logging.info(f"[age] {mint} is {age_minutes} min old")
 
                     if await has_liquidity(mint):
                         success, _ = await execute_buy(mint, client)
