@@ -16,7 +16,7 @@ import traceback
 logging.basicConfig(level=logging.INFO)
 logging.info("=== Bot started successfully ===")
 
-# --- CONFIG ---
+# --- ENVIRONMENT VARIABLES & VALIDATION ---
 REQUIRED_ENVS = [
     "PRIVATE_KEY", "HELIUS_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"
 ]
@@ -40,16 +40,15 @@ PROFIT_TARGET = float(os.getenv("PROFIT_TARGET", 1.5))
 STOP_LOSS = float(os.getenv("STOP_LOSS", 0.7))
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
 HELIUS_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
-WRAPPED_SOL = "So11111111111111111111111111111111111111112"
 JUPITER_QUOTE_URL = "https://quote-api.jup.ag/v6/quote"
 JUPITER_SWAP_URL = "https://quote-api.jup.ag/v6/swap"
+WRAPPED_SOL = "So11111111111111111111111111111111111111112"
 POSITIONS_FILE = "positions.json"
-MAX_TOKEN_AGE_SECONDS = 30 * 60  # 30 minutes
+MAX_TOKEN_AGE_SECONDS = 1800  # 30 minutes
 
-# --- POSITION STORAGE ---
+# --- POSITION PERSISTENCE ---
 def load_positions():
     if os.path.exists(POSITIONS_FILE):
         try:
@@ -66,7 +65,7 @@ def save_positions(positions):
     except Exception as e:
         logging.warning(f"Failed to save positions: {e}")
 
-positions = load_positions()
+positions = load_positions()  # mint -> {buy_price, time}
 
 # --- TELEGRAM ---
 async def send_telegram_message(message):
@@ -94,48 +93,8 @@ async def send_telegram_message(message):
                 await asyncio.sleep(2)
 
 # --- HELIUS & JUPITER HELPERS ---
-async def get_recent_signatures(limit=10):
-    payload = {
-        "jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
-        "params": [PUMP_PROGRAM_ID, {"limit": limit}]
-    }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(HELIUS_URL, json=payload, timeout=10) as resp:
-                result = await resp.json()
-                return [tx["signature"] for tx in result.get("result", [])]
-    except Exception as e:
-        logging.warning(f"[signatures] {e}")
-        return []
-
-async def get_token_mints_from_tx(signature):
-    payload = {
-        "jsonrpc": "2.0", "id": 1, "method": "getTransaction",
-        "params": [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
-    }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(HELIUS_URL, json=payload, timeout=10) as resp:
-                result = await resp.json()
-                meta = result.get("result", {}).get("meta", {})
-                mints = set()
-                for bal in meta.get("preTokenBalances", []) + meta.get("postTokenBalances", []):
-                    if "mint" in bal:
-                        mints.add(bal["mint"])
-                return list(mints)
-    except Exception as e:
-        logging.warning(f"[get_mints] {e}")
-        return []
-
-async def fetch_recent_tokens(limit=10):
-    signatures = await get_recent_signatures(limit)
-    all_mints = set()
-    for sig in signatures:
-        mints = await get_token_mints_from_tx(sig)
-        all_mints.update(mints)
-    return [{"mint": mint} for mint in all_mints if mint != WRAPPED_SOL]
-
 async def get_token_creation_time(mint):
+    # 1. Try getAccountInfo
     payload = {
         "jsonrpc": "2.0", "id": 1, "method": "getAccountInfo",
         "params": [mint, {"encoding": "jsonParsed"}]
@@ -145,12 +104,27 @@ async def get_token_creation_time(mint):
             async with session.post(HELIUS_URL, json=payload, timeout=10) as resp:
                 data = await resp.json()
                 block_time = data.get("result", {}).get("value", {}).get("blockTime")
-                if block_time is None:
-                    return None
-                return block_time
+                if block_time:
+                    return block_time
     except Exception as e:
-        logging.warning(f"[get_token_creation_time] {e}")
-        return None
+        logging.warning(f"[get_token_creation_time] primary failed: {e}")
+
+    # 2. Fallback: fetch first signature's blockTime
+    payload = {
+        "jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
+        "params": [mint, {"limit": 1}]
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(HELIUS_URL, json=payload, timeout=10) as resp:
+                data = await resp.json()
+                sigs = data.get("result", [])
+                if sigs and "blockTime" in sigs[0]:
+                    return sigs[0]["blockTime"]
+    except Exception as e:
+        logging.warning(f"[get_token_creation_time fallback] {e}")
+
+    return None
 
 async def has_liquidity(mint):
     params = {
@@ -205,10 +179,11 @@ async def execute_swap(swap_txn_b64, client):
     await client.confirm_transaction(sig.value)
     return sig.value
 
-# --- BUY / SELL LOGIC ---
+# --- BUY/SELL LOGIC ---
 async def execute_buy(mint, client):
     route = await get_swap_route(WRAPPED_SOL, mint, int(BUY_AMOUNT_SOL * 1_000_000_000))
     if not route:
+        logging.info(f"[buy] No route found for {mint}")
         return False, None
     swap_txn_b64 = await get_swap_transaction(route, str(keypair.pubkey()))
     sig = await execute_swap(swap_txn_b64, client)
@@ -220,7 +195,7 @@ async def execute_buy(mint, client):
 
 async def check_for_sell(client):
     for mint, info in list(positions.items()):
-        route = await get_swap_route(mint, WRAPPED_SOL, 1_000_000)
+        route = await get_swap_route(mint, WRAPPED_SOL, 1_000_000)  # Simulate sell
         if not route:
             continue
         price = float(route["outAmount"]) / float(route["inAmount"])
@@ -233,6 +208,38 @@ async def check_for_sell(client):
             save_positions(positions)
 
 # --- MAIN LOOP ---
+async def fetch_recent_tokens(limit=10):
+    payload = {
+        "jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
+        "params": [PUMP_PROGRAM_ID, {"limit": limit}]
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(HELIUS_URL, json=payload, timeout=10) as resp:
+                result = await resp.json()
+                signatures = [tx["signature"] for tx in result.get("result", [])]
+    except Exception as e:
+        logging.warning(f"[signatures] {e}")
+        return []
+
+    all_mints = set()
+    for sig in signatures:
+        tx_payload = {
+            "jsonrpc": "2.0", "id": 1, "method": "getTransaction",
+            "params": [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(HELIUS_URL, json=tx_payload, timeout=10) as resp:
+                    result = await resp.json()
+                    meta = result.get("result", {}).get("meta", {})
+                    for bal in meta.get("preTokenBalances", []) + meta.get("postTokenBalances", []):
+                        if "mint" in bal:
+                            all_mints.add(bal["mint"])
+        except Exception as e:
+            logging.warning(f"[get_mints] {e}")
+    return [{"mint": mint} for mint in all_mints if mint != WRAPPED_SOL]
+
 async def main_loop():
     async with AsyncClient(RPC_URL) as client:
         while True:
@@ -241,7 +248,10 @@ async def main_loop():
                 logging.info(f"[main] Fetched {len(tokens)} tokens")
                 for token in tokens:
                     mint = token.get("mint")
-                    if not mint or mint == WRAPPED_SOL or mint in positions:
+                    if not mint or mint == WRAPPED_SOL:
+                        continue
+                    if mint in positions:
+                        logging.info(f"[skip] {mint} already in positions")
                         continue
                     logging.info(f"[check] {mint}")
 
@@ -257,16 +267,17 @@ async def main_loop():
                         logging.info(f"[skip] {mint} too old ({age_minutes} min)")
                         continue
 
-                    if age < 0:
-                        logging.info(f"[skip] {mint} has invalid negative age ({age_minutes} min)")
-                        continue
-
                     logging.info(f"[age] {mint} is {age_minutes} min old")
 
                     if await has_liquidity(mint):
                         success, _ = await execute_buy(mint, client)
                         if success:
                             await asyncio.sleep(2)
+                        else:
+                            logging.info(f"[buy] Failed to buy {mint}")
+                    else:
+                        logging.info(f"[skip] {mint} has no liquidity")
+
                 await check_for_sell(client)
                 await asyncio.sleep(10)
             except Exception as e:
