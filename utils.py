@@ -13,13 +13,12 @@ from solana.rpc.types import TxOpts
 import asyncio
 import traceback
 
+# --- LOGGING ---
 logging.basicConfig(level=logging.INFO)
 logging.info("=== Bot started successfully ===")
 
-# --- ENVIRONMENT VARIABLES & VALIDATION ---
-REQUIRED_ENVS = [
-    "PRIVATE_KEY", "HELIUS_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"
-]
+# --- ENVIRONMENT SETUP ---
+REQUIRED_ENVS = ["PRIVATE_KEY", "HELIUS_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]
 for var in REQUIRED_ENVS:
     if not os.getenv(var):
         logging.error(f"Missing required environment variable: {var}")
@@ -38,15 +37,18 @@ BUY_AMOUNT_SOL = float(os.getenv("BUY_AMOUNT_SOL", 0.01))
 SLIPPAGE = float(os.getenv("SLIPPAGE", 3))
 PROFIT_TARGET = float(os.getenv("PROFIT_TARGET", 1.5))
 STOP_LOSS = float(os.getenv("STOP_LOSS", 0.7))
+MIN_LIQUIDITY_SOL = 20  # ✅ Minimum liquidity threshold
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+# --- CONSTANTS ---
 HELIUS_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 JUPITER_QUOTE_URL = "https://quote-api.jup.ag/v6/quote"
 JUPITER_SWAP_URL = "https://quote-api.jup.ag/v6/swap"
 WRAPPED_SOL = "So11111111111111111111111111111111111111112"
 POSITIONS_FILE = "positions.json"
-MAX_TOKEN_AGE_SECONDS = 1800  # 30 minutes
+MAX_TOKEN_AGE_SECONDS = 3600  # ✅ Allow tokens up to 1 hour old
 
 # --- POSITION PERSISTENCE ---
 def load_positions():
@@ -65,7 +67,7 @@ def save_positions(positions):
     except Exception as e:
         logging.warning(f"Failed to save positions: {e}")
 
-positions = load_positions()  # mint -> {buy_price, time}
+positions = load_positions()
 
 # --- TELEGRAM ---
 async def send_telegram_message(message):
@@ -94,7 +96,6 @@ async def send_telegram_message(message):
 
 # --- HELIUS & JUPITER HELPERS ---
 async def get_token_creation_time(mint):
-    # 1. Try getAccountInfo
     payload = {
         "jsonrpc": "2.0", "id": 1, "method": "getAccountInfo",
         "params": [mint, {"encoding": "jsonParsed"}]
@@ -106,10 +107,9 @@ async def get_token_creation_time(mint):
                 block_time = data.get("result", {}).get("value", {}).get("blockTime")
                 if block_time:
                     return block_time
-    except Exception as e:
-        logging.warning(f"[get_token_creation_time] primary failed: {e}")
-
-    # 2. Fallback: fetch first signature's blockTime
+    except Exception:
+        pass
+    # fallback
     payload = {
         "jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
         "params": [mint, {"limit": 1}]
@@ -121,9 +121,8 @@ async def get_token_creation_time(mint):
                 sigs = data.get("result", [])
                 if sigs and "blockTime" in sigs[0]:
                     return sigs[0]["blockTime"]
-    except Exception as e:
-        logging.warning(f"[get_token_creation_time fallback] {e}")
-
+    except Exception:
+        pass
     return None
 
 async def has_liquidity(mint):
@@ -139,9 +138,17 @@ async def has_liquidity(mint):
             async with session.get(JUPITER_QUOTE_URL, params=params, timeout=10) as resp:
                 data = await resp.json()
                 if resp.status != 200:
-                    logging.warning(f"[has_liquidity] Error {resp.status}: {data}")
                     return False
-                return bool(data.get("data"))
+                route = data.get("data", [None])[0]
+                if not route:
+                    return False
+                in_amount_sol = int(route["inAmount"]) / 1_000_000_000
+                out_amount_sol = int(route["outAmount"]) / 1_000_000_000
+                total_liquidity = in_amount_sol + out_amount_sol
+                if total_liquidity < MIN_LIQUIDITY_SOL:
+                    logging.info(f"[liquidity] {mint} has {total_liquidity:.2f} SOL (too low)")
+                    return False
+                return True
     except Exception as e:
         logging.warning(f"[has_liquidity] {e}")
         return False
@@ -190,22 +197,32 @@ async def execute_buy(mint, client):
     price = float(route["outAmount"]) / float(route["inAmount"])
     positions[mint] = {"buy_price": price, "time": datetime.now(timezone.utc).timestamp()}
     save_positions(positions)
-    await send_telegram_message(f"✅ Bought `{mint}`\nTx: https://solscan.io/tx/{sig}")
+    await send_telegram_message(f"✅ Bought `{mint}` at price: {round(price, 8)}\nTx: https://solscan.io/tx/{sig}")
     return True, sig
 
 async def check_for_sell(client):
     for mint, info in list(positions.items()):
-        route = await get_swap_route(mint, WRAPPED_SOL, 1_000_000)  # Simulate sell
+        route = await get_swap_route(mint, WRAPPED_SOL, 1_000_000)
         if not route:
             continue
         price = float(route["outAmount"]) / float(route["inAmount"])
         pnl = price / info["buy_price"]
-        if pnl >= PROFIT_TARGET or pnl <= STOP_LOSS:
+
+        if pnl >= PROFIT_TARGET:
+            reason = f"📈 1.5x profit target hit ({round(pnl, 2)}x)"
+        elif pnl <= STOP_LOSS:
+            reason = f"📉 Stop-loss triggered ({round(pnl, 2)}x)"
+        else:
+            continue
+
+        try:
             swap_txn_b64 = await get_swap_transaction(route, str(keypair.pubkey()))
             sig = await execute_swap(swap_txn_b64, client)
-            await send_telegram_message(f"💰 Sold `{mint}` at {round(pnl,2)}x\nTx: https://solscan.io/tx/{sig}")
+            await send_telegram_message(f"{reason}\n💰 Sold `{mint}`\nTx: https://solscan.io/tx/{sig}")
             del positions[mint]
             save_positions(positions)
+        except Exception as e:
+            logging.error(f"[sell] Failed to sell {mint}: {e}")
 
 # --- MAIN LOOP ---
 async def fetch_recent_tokens(limit=10):
@@ -248,33 +265,23 @@ async def main_loop():
                 logging.info(f"[main] Fetched {len(tokens)} tokens")
                 for token in tokens:
                     mint = token.get("mint")
-                    if not mint or mint == WRAPPED_SOL:
-                        continue
-                    if mint in positions:
-                        logging.info(f"[skip] {mint} already in positions")
+                    if not mint or mint == WRAPPED_SOL or mint in positions:
                         continue
                     logging.info(f"[check] {mint}")
 
                     creation_time = await get_token_creation_time(mint)
-                    if creation_time is None:
-                        logging.info(f"[skip] {mint} missing blockTime")
+                    if not creation_time:
                         continue
-
                     age = datetime.now(timezone.utc).timestamp() - creation_time
-                    age_minutes = round(age / 60, 2)
-
                     if age > MAX_TOKEN_AGE_SECONDS:
-                        logging.info(f"[skip] {mint} too old ({age_minutes} min)")
+                        logging.info(f"[skip] {mint} too old ({round(age / 60, 2)} min)")
                         continue
-
-                    logging.info(f"[age] {mint} is {age_minutes} min old")
+                    logging.info(f"[age] {mint} is {round(age / 60, 2)} min old")
 
                     if await has_liquidity(mint):
                         success, _ = await execute_buy(mint, client)
                         if success:
                             await asyncio.sleep(2)
-                        else:
-                            logging.info(f"[buy] Failed to buy {mint}")
                     else:
                         logging.info(f"[skip] {mint} has no liquidity")
 
@@ -284,7 +291,7 @@ async def main_loop():
                 logging.error(f"[loop] {e}\n{traceback.format_exc()}")
                 await asyncio.sleep(5)
 
-# --- GRACEFUL SHUTDOWN ---
+# --- SHUTDOWN ---
 def shutdown_handler(loop):
     logging.info("Shutting down gracefully...")
     save_positions(positions)
