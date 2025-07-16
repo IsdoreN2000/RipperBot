@@ -37,18 +37,17 @@ BUY_AMOUNT_SOL = float(os.getenv("BUY_AMOUNT_SOL", 0.01))
 SLIPPAGE = float(os.getenv("SLIPPAGE", 3))
 PROFIT_TARGET = float(os.getenv("PROFIT_TARGET", 1.5))
 STOP_LOSS = float(os.getenv("STOP_LOSS", 0.7))
-MIN_LIQUIDITY_SOL = 20  # ✅ Minimum liquidity threshold
+MIN_LIQUIDITY_SOL = 20
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# --- CONSTANTS ---
 HELIUS_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 JUPITER_QUOTE_URL = "https://quote-api.jup.ag/v6/quote"
 JUPITER_SWAP_URL = "https://quote-api.jup.ag/v6/swap"
 WRAPPED_SOL = "So11111111111111111111111111111111111111112"
 POSITIONS_FILE = "positions.json"
-MAX_TOKEN_AGE_SECONDS = 3600  # ✅ Allow tokens up to 1 hour old
+MAX_TOKEN_AGE_SECONDS = 3600
 
 # --- POSITION PERSISTENCE ---
 def load_positions():
@@ -109,7 +108,6 @@ async def get_token_creation_time(mint):
                     return block_time
     except Exception:
         pass
-    # fallback
     payload = {
         "jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
         "params": [mint, {"limit": 1}]
@@ -123,7 +121,9 @@ async def get_token_creation_time(mint):
                     return sigs[0]["blockTime"]
     except Exception:
         pass
-    return None
+    now = int(datetime.now(timezone.utc).timestamp())
+    logging.info(f"[creation] {mint} blockTime not found, assuming age = 0s")
+    return now
 
 async def has_liquidity(mint):
     params = {
@@ -137,18 +137,13 @@ async def has_liquidity(mint):
         async with aiohttp.ClientSession() as session:
             async with session.get(JUPITER_QUOTE_URL, params=params, timeout=10) as resp:
                 data = await resp.json()
-                if resp.status != 200:
-                    return False
                 route = data.get("data", [None])[0]
                 if not route:
                     return False
-                in_amount_sol = int(route["inAmount"]) / 1_000_000_000
-                out_amount_sol = int(route["outAmount"]) / 1_000_000_000
-                total_liquidity = in_amount_sol + out_amount_sol
-                if total_liquidity < MIN_LIQUIDITY_SOL:
-                    logging.info(f"[liquidity] {mint} has {total_liquidity:.2f} SOL (too low)")
-                    return False
-                return True
+                in_amount = int(route["inAmount"]) / 1_000_000_000
+                out_amount = int(route["outAmount"]) / 1_000_000_000
+                total_liquidity = in_amount + out_amount
+                return total_liquidity >= MIN_LIQUIDITY_SOL
     except Exception as e:
         logging.warning(f"[has_liquidity] {e}")
         return False
@@ -190,14 +185,13 @@ async def execute_swap(swap_txn_b64, client):
 async def execute_buy(mint, client):
     route = await get_swap_route(WRAPPED_SOL, mint, int(BUY_AMOUNT_SOL * 1_000_000_000))
     if not route:
-        logging.info(f"[buy] No route found for {mint}")
         return False, None
     swap_txn_b64 = await get_swap_transaction(route, str(keypair.pubkey()))
     sig = await execute_swap(swap_txn_b64, client)
     price = float(route["outAmount"]) / float(route["inAmount"])
     positions[mint] = {"buy_price": price, "time": datetime.now(timezone.utc).timestamp()}
     save_positions(positions)
-    await send_telegram_message(f"✅ Bought `{mint}` at price: {round(price, 8)}\nTx: https://solscan.io/tx/{sig}")
+    await send_telegram_message(f"✅ Bought `{mint}` at {round(price,8)}\nTx: https://solscan.io/tx/{sig}")
     return True, sig
 
 async def check_for_sell(client):
@@ -207,22 +201,13 @@ async def check_for_sell(client):
             continue
         price = float(route["outAmount"]) / float(route["inAmount"])
         pnl = price / info["buy_price"]
-
-        if pnl >= PROFIT_TARGET:
-            reason = f"📈 1.5x profit target hit ({round(pnl, 2)}x)"
-        elif pnl <= STOP_LOSS:
-            reason = f"📉 Stop-loss triggered ({round(pnl, 2)}x)"
-        else:
-            continue
-
-        try:
+        if pnl >= PROFIT_TARGET or pnl <= STOP_LOSS:
+            reason = "📈 1.5x Profit" if pnl >= PROFIT_TARGET else "📉 Stop-loss"
             swap_txn_b64 = await get_swap_transaction(route, str(keypair.pubkey()))
             sig = await execute_swap(swap_txn_b64, client)
-            await send_telegram_message(f"{reason}\n💰 Sold `{mint}`\nTx: https://solscan.io/tx/{sig}")
+            await send_telegram_message(f"{reason}\n💰 Sold `{mint}` at {round(pnl,2)}x\nTx: https://solscan.io/tx/{sig}")
             del positions[mint]
             save_positions(positions)
-        except Exception as e:
-            logging.error(f"[sell] Failed to sell {mint}: {e}")
 
 # --- MAIN LOOP ---
 async def fetch_recent_tokens(limit=10):
@@ -268,23 +253,18 @@ async def main_loop():
                     if not mint or mint == WRAPPED_SOL or mint in positions:
                         continue
                     logging.info(f"[check] {mint}")
-
                     creation_time = await get_token_creation_time(mint)
-                    if not creation_time:
-                        continue
                     age = datetime.now(timezone.utc).timestamp() - creation_time
                     if age > MAX_TOKEN_AGE_SECONDS:
-                        logging.info(f"[skip] {mint} too old ({round(age / 60, 2)} min)")
+                        logging.info(f"[skip] {mint} too old ({round(age/60, 2)} min)")
                         continue
-                    logging.info(f"[age] {mint} is {round(age / 60, 2)} min old")
-
+                    logging.info(f"[age] {mint} is {round(age/60, 2)} min old")
                     if await has_liquidity(mint):
                         success, _ = await execute_buy(mint, client)
                         if success:
                             await asyncio.sleep(2)
                     else:
                         logging.info(f"[skip] {mint} has no liquidity")
-
                 await check_for_sell(client)
                 await asyncio.sleep(10)
             except Exception as e:
