@@ -28,8 +28,22 @@ PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 JUPITER_QUOTE_URL = "https://quote-api.jup.ag/v6/quote"
 JUPITER_SWAP_URL = "https://quote-api.jup.ag/v6/swap"
 WRAPPED_SOL = "So11111111111111111111111111111111111111112"
+PROFIT_TARGET = float(os.getenv("PROFIT_TARGET", 1.5))
+STOP_LOSS = float(os.getenv("STOP_LOSS", 0.8))
+PRICE_CHECK_INTERVAL = int(os.getenv("PRICE_CHECK_INTERVAL", 30))
 
-# --- HELIUS TX FETCHING (ASYNC) ---
+last_liquidity_check = {}
+held_tokens = {}
+
+# --- GLOBAL JUPITER RATE LIMITER ---
+JUPITER_RATE_LIMIT = 60  # requests per minute
+jupiter_semaphore = asyncio.Semaphore(JUPITER_RATE_LIMIT)
+
+async def jupiter_rate_limiter():
+    async with jupiter_semaphore:
+        await asyncio.sleep(60 / JUPITER_RATE_LIMIT)
+
+# --- HELIUS TX FETCHING ---
 async def get_recent_signatures(limit=10):
     payload = {
         "jsonrpc": "2.0",
@@ -43,7 +57,7 @@ async def get_recent_signatures(limit=10):
                 result = await resp.json()
                 return [tx["signature"] for tx in result.get("result", [])]
     except Exception as e:
-        logging.warning(f"[get_recent_signatures] Failed to fetch signatures: {e}\n{traceback.format_exc()}")
+        logging.warning(f"[get_recent_signatures] Failed: {e}\n{traceback.format_exc()}")
         return []
 
 async def get_token_mints_from_tx(signature):
@@ -78,7 +92,7 @@ async def get_token_mints_from_tx(signature):
 
                 return list(mints)
     except Exception as e:
-        logging.warning(f"[get_token_mints_from_tx] Failed to parse tx {signature}: {e}\n{traceback.format_exc()}")
+        logging.warning(f"[get_token_mints_from_tx] Failed for {signature}: {e}\n{traceback.format_exc()}")
         return []
 
 async def fetch_recent_tokens(limit=10):
@@ -89,8 +103,16 @@ async def fetch_recent_tokens(limit=10):
         all_mints.update(mints)
     return [{"mint": mint} for mint in all_mints if mint != WRAPPED_SOL]
 
-# --- LIQUIDITY CHECK ---
+# --- JUPITER UTILITIES ---
+async def throttle_liquidity_check(mint):
+    now = datetime.utcnow().timestamp()
+    if mint in last_liquidity_check and now - last_liquidity_check[mint] < 1.1:
+        await asyncio.sleep(1.1)
+    last_liquidity_check[mint] = now
+
 async def has_liquidity(mint):
+    await jupiter_rate_limiter()  # Global rate limiter
+    await throttle_liquidity_check(mint)
     params = {
         "inputMint": WRAPPED_SOL,
         "outputMint": mint,
@@ -103,15 +125,15 @@ async def has_liquidity(mint):
             async with session.get(JUPITER_QUOTE_URL, params=params, timeout=10) as resp:
                 data = await resp.json()
                 if resp.status != 200:
-                    logging.warning(f"[has_liquidity] Jupiter liquidity check error: {resp.status}, response: {data}")
+                    logging.warning(f"[has_liquidity] Error {resp.status}: {data}")
                     return False
                 return bool(data.get("data"))
     except Exception as e:
-        logging.warning(f"[has_liquidity] Liquidity check failed for {mint}: {e}\n{traceback.format_exc()}")
+        logging.warning(f"[has_liquidity] Failed for {mint}: {e}\n{traceback.format_exc()}")
         return False
 
-# --- BUYING LOGIC ---
 async def get_swap_route(input_mint, output_mint, amount, slippage=3):
+    await jupiter_rate_limiter()  # Global rate limiter
     params = {
         "inputMint": input_mint,
         "outputMint": output_mint,
@@ -124,13 +146,14 @@ async def get_swap_route(input_mint, output_mint, amount, slippage=3):
             async with session.get(JUPITER_QUOTE_URL, params=params, timeout=10) as resp:
                 data = await resp.json()
                 if resp.status != 200 or not data.get("data"):
-                    raise Exception(f"Jupiter error: {resp.status}, data: {data}")
+                    raise Exception(f"Route fetch failed: {resp.status} {data}")
                 return data["data"][0]
     except Exception as e:
-        logging.error(f"[get_swap_route] Error ({output_mint}): {e}\n{traceback.format_exc()}")
+        logging.error(f"[get_swap_route] {e}\n{traceback.format_exc()}")
         raise
 
 async def get_swap_transaction(route, user_public_key):
+    await jupiter_rate_limiter()  # Global rate limiter
     payload = {
         "route": route,
         "userPublicKey": user_public_key,
@@ -142,10 +165,10 @@ async def get_swap_transaction(route, user_public_key):
             async with session.post(JUPITER_SWAP_URL, json=payload, timeout=10) as resp:
                 data = await resp.json()
                 if resp.status != 200 or "swapTransaction" not in data:
-                    raise Exception(f"Jupiter swap error: {data}")
+                    raise Exception(f"Transaction build failed: {data}")
                 return data["swapTransaction"]
     except Exception as e:
-        logging.error(f"[get_swap_transaction] Error: {e}\n{traceback.format_exc()}")
+        logging.error(f"[get_swap_transaction] {e}\n{traceback.format_exc()}")
         raise
 
 async def execute_swap(swap_txn_b64, client):
@@ -157,27 +180,37 @@ async def execute_swap(swap_txn_b64, client):
         await client.confirm_transaction(sig.value)
         return sig.value
     except Exception as e:
-        logging.error(f"[execute_swap] Error: {e}\n{traceback.format_exc()}")
+        logging.error(f"[execute_swap] {e}\n{traceback.format_exc()}")
         raise
 
-async def execute_buy(mint, max_retries=3):
+# --- BUY AND SELL EXECUTION ---
+async def execute_buy(mint):
     input_mint = WRAPPED_SOL
     amount = int(BUY_AMOUNT_SOL * 1_000_000_000)
-    for attempt in range(max_retries):
-        try:
-            async with AsyncClient(RPC_URL) as client:
-                logging.info(f"[execute_buy] Attempting to buy token {mint} for {BUY_AMOUNT_SOL} SOL (Attempt {attempt+1})...")
-                route = await get_swap_route(input_mint, mint, amount, SLIPPAGE)
-                swap_txn_b64 = await get_swap_transaction(route, str(keypair.pubkey()))
-                sig = await execute_swap(swap_txn_b64, client)
+    try:
+        async with AsyncClient(RPC_URL) as client:
+            route = await get_swap_route(input_mint, mint, amount, SLIPPAGE)
+            swap_txn_b64 = await get_swap_transaction(route, str(keypair.pubkey()))
+            sig = await execute_swap(swap_txn_b64, client)
+            held_tokens[mint] = {
+                "buy_price": float(route["outAmount"]) / 10**route["outDecimals"]
+            }
             return True, sig
-        except Exception as e:
-            logging.warning(f"[execute_buy] Attempt {attempt+1} failed for {mint}: {e}\n{traceback.format_exc()}")
-            await send_telegram_message(f"⚠️ Buy attempt {attempt+1} failed for {mint}:\n{e}")
-            await asyncio.sleep(2 * (attempt + 1))
-    logging.error(f"[execute_buy] All {max_retries} attempts failed for {mint}.")
-    await send_telegram_message(f"❌ All {max_retries} buy attempts failed for {mint}.")
-    return False, None
+    except Exception as e:
+        await send_telegram_message(f"❌ Buy failed for {mint}: {e}")
+        return False, None
+
+async def execute_sell(mint):
+    token = held_tokens[mint]
+    try:
+        async with AsyncClient(RPC_URL) as client:
+            route = await get_swap_route(mint, WRAPPED_SOL, int(token["buy_price"] * 1_000_000_000), SLIPPAGE)
+            swap_txn_b64 = await get_swap_transaction(route, str(keypair.pubkey()))
+            sig = await execute_swap(swap_txn_b64, client)
+            await send_telegram_message(f"✅ Sold {mint} for profit/loss. Tx: {sig}")
+            del held_tokens[mint]
+    except Exception as e:
+        await send_telegram_message(f"❌ Sell failed for {mint}: {e}")
 
 # --- TELEGRAM ---
 async def send_telegram_message(message):
@@ -194,7 +227,7 @@ async def send_telegram_message(message):
         try:
             await session.post(url, json=payload, timeout=10)
         except Exception as e:
-            logging.error(f"[send_telegram_message] Telegram error: {e}\n{traceback.format_exc()}")
+            logging.error(f"[send_telegram_message] {e}\n{traceback.format_exc()}")
 
 # --- FILTER ---
 def is_token_eligible(token):
@@ -204,33 +237,35 @@ def is_token_eligible(token):
     return True, ""
 
 # --- MAIN LOOP ---
+async def monitor_prices():
+    while True:
+        for mint in list(held_tokens):
+            try:
+                route = await get_swap_route(mint, WRAPPED_SOL, int(held_tokens[mint]["buy_price"] * 1_000_000_000))
+                out_amount = float(route["outAmount"]) / 10**route["outDecimals"]
+                pnl = out_amount / held_tokens[mint]["buy_price"]
+                if pnl >= PROFIT_TARGET or pnl <= STOP_LOSS:
+                    await execute_sell(mint)
+            except Exception as e:
+                logging.warning(f"[monitor_prices] Failed for {mint}: {e}")
+        await asyncio.sleep(PRICE_CHECK_INTERVAL)
+
 async def main():
     tokens = await fetch_recent_tokens(limit=10)
-    logging.info(f"[main] Recent token mints: {[t['mint'] for t in tokens]}")
     for token in tokens:
         mint = token.get("mint")
         eligible, reason = is_token_eligible(token)
-        if eligible:
-            has_pool = await has_liquidity(mint)
-            if not has_pool:
-                logging.info(f"[main] Skipped token {mint}: No liquidity pool found.")
-                continue
+        if eligible and await has_liquidity(mint):
             success, sig = await execute_buy(mint)
             if success:
                 await send_telegram_message(f"✅ Bought {mint}\nTx: {sig}")
-        else:
-            logging.info(f"[main] Skipped token {mint}: {reason}")
         await asyncio.sleep(1)
 
 async def main_loop():
-    while True:
-        try:
-            await main()
-            await asyncio.sleep(10)
-        except Exception as e:
-            logging.error(f"[main_loop] Error in main loop: {e}\n{traceback.format_exc()}")
-            await send_telegram_message(f"❗ Error in main loop: {e}")
-            await asyncio.sleep(5)
+    await asyncio.gather(
+        monitor_prices(),
+        *(main() for _ in range(1))  # adjustable for concurrent scans
+    )
 
 if __name__ == "__main__":
     asyncio.run(main_loop())
