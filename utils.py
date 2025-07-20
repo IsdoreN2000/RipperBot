@@ -44,3 +44,12 @@ async def get_recent_tokens_from_helius(program_ids):
                         for acc in tx.get("tokenTransfers", []):
                             if acc["mint"] not in [t["mint"] for t in tokens]:
                                 tokens.append({
+                                    "mint": acc["mint"],
+                                    "amount": acc.get("amount"),
+                                    "source": acc.get("source"),
+                                    "destination": acc.get("destination"),
+                                    "timestamp": timestamp
+                                })
+        except Exception as e:
+            logger.warning(f"Error fetching tokens for {program_id}: {e}")
+    return tokens
