@@ -26,7 +26,17 @@ async def get_recent_tokens_from_helius(program_ids):
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as resp:
-                data = await resp.json()
+                logger.warning(f"Helius API status: {resp.status}")
+                text = await resp.text()
+                logger.warning(f"Helius API raw response: {text}")
+                try:
+                    data = await resp.json(content_type=None)
+                except Exception as json_err:
+                    logger.warning(f"Failed to parse JSON: {json_err}")
+                    return []
+                if not isinstance(data, list):
+                    logger.warning(f"Unexpected data format (expected list): {data}")
+                    return []
                 for tx in data:
                     timestamp = tx.get("timestamp", int(time.time()))
                     for acc in tx.get("tokenTransfers", []):
