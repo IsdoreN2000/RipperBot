@@ -1,5 +1,3 @@
-# utils.py
-
 import aiohttp
 import asyncio
 import base64
@@ -8,8 +6,20 @@ import logging
 import os
 import time
 from decimal import Decimal
-from solana.publickey import PublicKey
-from solders.pubkey import Pubkey
+
+# --- Dependency Check: solana and solders ---
+try:
+    from solana.publickey import PublicKey
+except Exception as e:
+    print(f"[startup][error] Failed to import solana.publickey: {e}")
+    raise
+
+try:
+    from solders.pubkey import Pubkey
+except Exception as e:
+    print(f"[startup][error] Failed to import solders.pubkey: {e}")
+    raise
+
 from filelock import FileLock
 from dotenv import load_dotenv
 
@@ -26,6 +36,7 @@ HEADERS = {
 
 logger = logging.getLogger(__name__)
 
+# --- Fetch recent tokens from Helius ---
 async def get_recent_tokens_from_helius(program_ids):
     url = f"{HELIUS_BASE_URL}"
     limit = 20
@@ -58,6 +69,7 @@ async def get_recent_tokens_from_helius(program_ids):
                             })
     return recent_tokens
 
+# --- Helper: fetch token mint from a transaction signature ---
 async def fetch_token_mint_from_signature(session, signature):
     payload = {
         "jsonrpc": "2.0",
@@ -81,6 +93,7 @@ async def fetch_token_mint_from_signature(session, signature):
             return None
     return None
 
+# --- Check if a token has sufficient liquidity ---
 async def has_sufficient_liquidity(mint: str, min_liquidity_lamports: int) -> bool:
     url = f"{JUPITER_API_BASE_URL}/v6/pools?mint={mint}"
     async with aiohttp.ClientSession() as session:
@@ -93,38 +106,58 @@ async def has_sufficient_liquidity(mint: str, min_liquidity_lamports: int) -> bo
                         return True
     return False
 
+# --- Fetch token metadata (placeholder) ---
 async def get_token_metadata(mint):
     return {"name": mint[:4]}  # Placeholder for real metadata fetch
 
+# --- Buy token (mock implementation) ---
 async def buy_token(mint, amount_sol, tip=5000):
     return {"success": True}  # Mock response
 
+# --- Get token price (mock implementation) ---
 async def get_token_price(mint):
     return 1.0  # Mock price
 
+# --- Sell token (mock implementation) ---
 async def sell_token(mint):
     logger.info(f"[mock sell] Selling token {mint}")
 
+# --- Send Telegram message (mock implementation) ---
 async def send_telegram_message(message: str):
     logger.info(f"[telegram] {message}")
 
+# --- Async load positions from file ---
 async def load_positions(filepath: str):
     try:
-        with open(filepath, 'r') as f:
-            return json.load(f)
+        loop = asyncio.get_event_loop()
+        if not os.path.exists(filepath):
+            return {}
+        return await loop.run_in_executor(None, lambda: json.load(open(filepath, "r")))
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
-def save_positions(filepath: str, positions: dict, lockfile: str):
-    with FileLock(lockfile):
-        with open(filepath, 'w') as f:
-            json.dump(positions, f, indent=4)
+# --- Async save positions to file with file lock ---
+async def save_positions(filepath: str, positions: dict, lockfile: str):
+    loop = asyncio.get_event_loop()
+    def write_json():
+        with FileLock(lockfile):
+            with open(filepath, "w") as f:
+                json.dump(positions, f, indent=4)
+    await loop.run_in_executor(None, write_json)
 
-def acquire_file_lock(lockfile: str):
-    lock = FileLock(lockfile)
-    lock.acquire()
+# --- Acquire file lock (sync, for startup/shutdown) ---
+async def acquire_file_lock(lockfile: str):
+    loop = asyncio.get_event_loop()
+    def acquire():
+        lock = FileLock(lockfile)
+        lock.acquire()
+    await loop.run_in_executor(None, acquire)
 
-def release_file_lock(lockfile: str):
-    lock = FileLock(lockfile)
-    if lock.is_locked:
-        lock.release()
+# --- Release file lock (sync, for shutdown) ---
+async def release_file_lock(lockfile: str):
+    loop = asyncio.get_event_loop()
+    def release():
+        lock = FileLock(lockfile)
+        if lock.is_locked:
+            lock.release()
+    await loop.run_in_executor(None, release)
