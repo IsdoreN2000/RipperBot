@@ -1,133 +1,130 @@
+# utils.py
+
 import aiohttp
-import aiofiles
-import json
-import os
+import asyncio
 import base64
+import json
 import logging
-from datetime import datetime, timezone
+import os
+import time
+from decimal import Decimal
+from solana.publickey import PublicKey
 from solders.pubkey import Pubkey
-from solana.rpc.async_api import AsyncClient
-from solana.rpc.types import TokenAccountOpts
 from filelock import FileLock
+from dotenv import load_dotenv
 
-# Helius settings
+load_dotenv()
+
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
-HELIUS_URL = f"https://mainnet.helius.xyz/v0/addresses"
+HELIUS_BASE_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+JUPITER_API_BASE_URL = "https://quote-api.jup.ag"
 
-# Token Program ID (SPL)
-TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+HEADERS = {
+    "accept": "application/json",
+    "Content-Type": "application/json"
+}
 
-# Jupiter swap settings
-JUPITER_QUOTE_API = "https://quote-api.jup.ag/v6/quote"
-JUPITER_SWAP_API = "https://quote-api.jup.ag/v6/swap"
-RPC_URL = os.getenv("RPC_URL", "https://api.mainnet-beta.solana.com")
+logger = logging.getLogger(__name__)
 
-# Telegram
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+async def get_recent_tokens_from_helius(program_ids):
+    url = f"{HELIUS_BASE_URL}"
+    limit = 20
+    seen_mints = set()
+    recent_tokens = []
 
-# Wallet
-WALLET = os.getenv("WALLET")
-
-
-async def get_recent_tokens_from_helius(program_ids, limit=25):
-    headers = {"Content-Type": "application/json"}
-    tokens = []
-    for program_id in program_ids:
-        url = f"https://api.helius.xyz/v0/addresses/{program_id}/transactions?api-key={HELIUS_API_KEY}"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as resp:
-                data = await resp.json()
-                for tx in data:
-                    if 'tokenTransfers' in tx:
-                        for transfer in tx['tokenTransfers']:
-                            if transfer['tokenAmount'] and transfer['mint']:
-                                timestamp = tx['timestamp']
-                                tokens.append({
-                                    "mint": transfer['mint'],
-                                    "timestamp": timestamp
-                                })
-    return tokens
-
-
-async def has_sufficient_liquidity(mint: str, min_liquidity_lamports: int) -> bool:
-    url = f"https://public-api.birdeye.so/public/pair/mint/{mint}"
-    headers = {"X-API-KEY": os.getenv("BIRDEYE_API_KEY")}
     async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as resp:
-            if resp.status != 200:
-                return False
-            data = await resp.json()
-            try:
-                liquidity = data['data']['liquidity']['base'] + data['data']['liquidity']['quote']
-                return liquidity >= min_liquidity_lamports
-            except:
-                return False
+        for program_id in program_ids:
+            payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getSignaturesForAddress",
+                "params": [program_id, {"limit": limit}]
+            }
+            async with session.post(url, json=payload, headers=HEADERS) as resp:
+                result = await resp.json()
+                signatures = result.get("result", [])
 
+                for sig in signatures:
+                    signature = sig["signature"]
+                    ts = sig.get("blockTime", int(time.time()))
+                    token_info = await fetch_token_mint_from_signature(session, signature)
+                    if token_info:
+                        mint = token_info["mint"]
+                        if mint not in seen_mints:
+                            seen_mints.add(mint)
+                            recent_tokens.append({
+                                "mint": mint,
+                                "timestamp": ts
+                            })
+    return recent_tokens
 
-async def get_token_metadata(mint: str):
-    url = f"https://api.helius.xyz/v0/tokens/metadata?api-key={HELIUS_API_KEY}"
-    body = {"mints": [mint]}
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, json=body) as resp:
-            result = await resp.json()
-            if result and isinstance(result, list):
-                return result[0]
-    return {"name": "Unknown", "symbol": "UNK"}
-
-
-async def buy_token(mint: str, amount_sol: float, tip: int = 5000):
-    # Simulated buy logic
-    return {"success": True}
-
-
-async def sell_token(mint: str):
-    # Simulated sell logic
-    return {"success": True}
-
-
-async def get_token_price(mint: str):
-    url = f"https://public-api.birdeye.so/public/price?address={mint}"
-    headers = {"X-API-KEY": os.getenv("BIRDEYE_API_KEY")}
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return data.get("data", {}).get("value", None)
+async def fetch_token_mint_from_signature(session, signature):
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getTransaction",
+        "params": [signature, {"encoding": "json"}]
+    }
+    async with session.post(HELIUS_BASE_URL, json=payload, headers=HEADERS) as resp:
+        result = await resp.json()
+        transaction = result.get("result")
+        if not transaction:
+            return None
+        try:
+            instructions = transaction["transaction"]["message"]["instructions"]
+            for ix in instructions:
+                if "parsed" in ix:
+                    parsed = ix["parsed"]
+                    if parsed["type"] == "initializeMint":
+                        return {"mint": parsed["info"]["mint"]}
+        except Exception:
+            return None
     return None
 
-
-async def send_telegram_message(text: str):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    data = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+async def has_sufficient_liquidity(mint: str, min_liquidity_lamports: int) -> bool:
+    url = f"{JUPITER_API_BASE_URL}/v6/pools?mint={mint}"
     async with aiohttp.ClientSession() as session:
-        await session.post(url, data=data)
+        async with session.get(url) as resp:
+            data = await resp.json()
+            for pool in data:
+                reserves = pool.get("reserves", [])
+                for reserve in reserves:
+                    if reserve and int(reserve) >= min_liquidity_lamports:
+                        return True
+    return False
 
+async def get_token_metadata(mint):
+    return {"name": mint[:4]}  # Placeholder for real metadata fetch
 
-async def load_positions(filename: str) -> dict:
+async def buy_token(mint, amount_sol, tip=5000):
+    return {"success": True}  # Mock response
+
+async def get_token_price(mint):
+    return 1.0  # Mock price
+
+async def sell_token(mint):
+    logger.info(f"[mock sell] Selling token {mint}")
+
+async def send_telegram_message(message: str):
+    logger.info(f"[telegram] {message}")
+
+async def load_positions(filepath: str):
     try:
-        async with aiofiles.open(filename, mode='r') as f:
-            content = await f.read()
-            return json.loads(content)
-    except:
+        with open(filepath, 'r') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
+def save_positions(filepath: str, positions: dict, lockfile: str):
+    with FileLock(lockfile):
+        with open(filepath, 'w') as f:
+            json.dump(positions, f, indent=4)
 
-async def save_positions(filename: str, positions: dict, lockfile: str):
+def acquire_file_lock(lockfile: str):
     lock = FileLock(lockfile)
-    async with lock:
-        async with aiofiles.open(filename, mode='w') as f:
-            await f.write(json.dumps(positions))
+    lock.acquire()
 
-
-async def acquire_file_lock(lockfile: str):
-    lock = FileLock(lockfile)
-    await lock.acquire()
-
-
-async def release_file_lock(lockfile: str):
+def release_file_lock(lockfile: str):
     lock = FileLock(lockfile)
     if lock.is_locked:
-        await lock.release()
+        lock.release()
