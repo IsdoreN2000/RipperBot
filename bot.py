@@ -1,94 +1,150 @@
 import asyncio
+import json
 import logging
+import os
 import signal
 import sys
 import time
-import json
-import aiofiles
-import aiofiles.os
-import os
+from decimal import Decimal
+from dotenv import load_dotenv
 from utils import (
     get_recent_tokens_from_helius,
-    check_liquidity,
-    should_buy_token,
-    execute_buy,
-    monitor_and_sell,
+    has_sufficient_liquidity,
+    get_token_metadata,
+    buy_token,
+    get_token_price,
+    sell_token,
+    send_telegram_message,
     load_positions,
     save_positions,
-    telegram_alert
+    acquire_file_lock,
+    release_file_lock
 )
 
-logging.basicConfig(level=logging.INFO)
+load_dotenv()
 
-PROGRAM_IDS = [
+# --- Configurable Parameters ---
+MIN_TOKEN_AGE_SECONDS = int(os.getenv("MIN_TOKEN_AGE_SECONDS", 60))
+MAX_TOKEN_AGE_SECONDS = int(os.getenv("MAX_TOKEN_AGE_SECONDS", 3600))
+MIN_LIQUIDITY_LAMPORTS = int(os.getenv("MIN_LIQUIDITY_LAMPORTS", 20 * 1_000_000_000))
+BUY_AMOUNT_SOL = float(os.getenv("BUY_AMOUNT_SOL", 0.01))
+PROFIT_TARGET_MULTIPLIER = float(os.getenv("PROFIT_TARGET_MULTIPLIER", 2.0))
+STOP_LOSS_MULTIPLIER = float(os.getenv("STOP_LOSS_MULTIPLIER", 0.5))
+TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "false").lower() == "true"
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", 5))
+JITO_TIP = int(os.getenv("JITO_TIP", 5000))
+
+# --- Program IDs for Pump.fun and Bunk.fun ---
+PUMP_PROGRAM_IDS = [
     "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",  # Pump.fun
-    "BUNKU1mDhD6GNnpHJRZAZpEj3nGoqVZZe8RvAdTaLyoz"   # Bunk.fun (correct ID)
+    "BUNKU1mDhD6GNnpHJRZAZpEj3nGoqVZZe8RvAdTaLyoz"   # Bunk.fun
 ]
 
-FETCH_INTERVAL = 5  # seconds
-POSITIONS_FILE = "positions.json"
-positions = load_positions()
-seen_tokens = set(token["mint"] for token in positions)
+# Setup logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(message)s")
+logger = logging.getLogger(__name__)
 
+# Track positions
+positions = {}
+positions_file = "positions.json"
+lock_file = "positions.lock"
+
+# Graceful shutdown
 running = True
 
-def handle_sigterm(*args):
+def handle_shutdown(sig, frame):
     global running
     running = False
-    logging.info("[shutdown] Gracefully shutting down...")
-    save_positions(positions)
-    sys.exit(0)
+    logger.info("Shutting down...")
 
-signal.signal(signal.SIGTERM, handle_sigterm)
-signal.signal(signal.SIGINT, handle_sigterm)
+signal.signal(signal.SIGINT, handle_shutdown)
+signal.signal(signal.SIGTERM, handle_shutdown)
 
-async def safe_get_tokens(program_id):
-    retries = 3
-    for attempt in range(retries):
+async def monitor_tokens():
+    global positions
+    while running:
         try:
-            tokens = await get_recent_tokens_from_helius(program_id)
-            return tokens
+            token_mints = await get_recent_tokens_from_helius(PUMP_PROGRAM_IDS)
+            logger.info(f"[main] Fetched {len(token_mints)} tokens")
+            for token in token_mints:
+                if not running:
+                    break
+
+                mint = token['mint']
+                timestamp = token['timestamp']
+                age = int(time.time()) - timestamp
+                logger.info(f"[check] {mint}")
+
+                if mint in positions:
+                    continue
+                if age < MIN_TOKEN_AGE_SECONDS:
+                    logger.info(f"[skip] {mint} too new ({age}s)")
+                    continue
+                if age > MAX_TOKEN_AGE_SECONDS:
+                    logger.info(f"[skip] {mint} too old ({age}s)")
+                    continue
+
+                if not await has_sufficient_liquidity(mint, MIN_LIQUIDITY_LAMPORTS):
+                    logger.info(f"[skip] {mint} insufficient liquidity")
+                    continue
+
+                metadata = await get_token_metadata(mint)
+                buy_response = await buy_token(mint, BUY_AMOUNT_SOL, tip=JITO_TIP)
+                if buy_response['success']:
+                    buy_price = await get_token_price(mint)
+                    if buy_price is None:
+                        logger.warning(f"[warn] {mint} bought but failed to fetch price")
+                        continue
+
+                    logger.info(f"[buy] {mint} at price {buy_price}")
+                    if TELEGRAM_ENABLED:
+                        await send_telegram_message(f"Bought {metadata['name']} ({mint}) at price {buy_price}")
+
+                    positions[mint] = {
+                        "buy_price": buy_price,
+                        "timestamp": int(time.time()),
+                        "metadata": metadata
+                    }
+                    await save_positions(positions_file, positions, lock_file)
+                else:
+                    logger.info(f"[skip] {mint} buy failed: {buy_response['error']}")
+
+            # Check sell conditions
+            for mint, data in list(positions.items()):
+                current_price = await get_token_price(mint)
+                if current_price is None:
+                    continue
+                buy_price = data['buy_price']
+                if current_price >= buy_price * PROFIT_TARGET_MULTIPLIER:
+                    logger.info(f"[sell] {mint} hit profit target: {current_price}")
+                    await sell_token(mint)
+                    if TELEGRAM_ENABLED:
+                        await send_telegram_message(f"Sold {data['metadata']['name']} ({mint}) for profit at {current_price}")
+                    positions.pop(mint)
+                    await save_positions(positions_file, positions, lock_file)
+                elif current_price <= buy_price * STOP_LOSS_MULTIPLIER:
+                    logger.info(f"[sell] {mint} hit stop loss: {current_price}")
+                    await sell_token(mint)
+                    if TELEGRAM_ENABLED:
+                        await send_telegram_message(f"Sold {data['metadata']['name']} ({mint}) for loss at {current_price}")
+                    positions.pop(mint)
+                    await save_positions(positions_file, positions, lock_file)
+
+            await asyncio.sleep(POLL_INTERVAL)
         except Exception as e:
-            logging.warning(f"[retry] Fetch failed for {program_id}, attempt {attempt+1}/{retries}: {e}")
-            await asyncio.sleep(1)
-    return []
+            logger.exception(f"[error] {str(e)}")
+            await asyncio.sleep(5)
 
 async def main():
-    logging.info("[main] Bot started")
-
-    while running:
-        all_tokens = []
-
-        for program_id in PROGRAM_IDS:
-            tokens = await safe_get_tokens(program_id)
-            logging.info(f"[main] Fetched {len(tokens)} tokens from {program_id}")
-            all_tokens.extend(tokens)
-
-        for token in all_tokens:
-            mint = token["mint"]
-            if mint in seen_tokens:
-                continue
-
-            logging.info(f"[check] {mint}")
-
-            if not should_buy_token(token):
-                logging.info(f"[skip] {mint} did not pass filters")
-                continue
-
-            if not await check_liquidity(mint):
-                logging.info(f"[skip] {mint} insufficient liquidity")
-                continue
-
-            bought = await execute_buy(mint)
-            if bought:
-                seen_tokens.add(mint)
-                timestamp = int(time.time())
-                positions.append({"mint": mint, "bought_at": timestamp})
-                save_positions(positions)
-                telegram_alert(f"✅ Bought token: {mint}")
-                asyncio.create_task(monitor_and_sell(mint, positions, seen_tokens))
-
-        await asyncio.sleep(FETCH_INTERVAL)
+    logger.info("Starting bot...")
+    await acquire_file_lock(lock_file)
+    global positions
+    positions = await load_positions(positions_file)
+    try:
+        await monitor_tokens()
+    finally:
+        await save_positions(positions_file, positions, lock_file)
+        await release_file_lock(lock_file)
 
 if __name__ == "__main__":
     asyncio.run(main())
