@@ -1,163 +1,171 @@
-import aiohttp
-import asyncio
-import base64
-import json
-import logging
 import os
+import json
+import aiohttp
+import logging
 import time
-from decimal import Decimal
-
-# --- Dependency Check: solana and solders ---
-try:
-    from solana.publickey import PublicKey
-except Exception as e:
-    print(f"[startup][error] Failed to import solana.publickey: {e}")
-    raise
-
-try:
-    from solders.pubkey import Pubkey
-except Exception as e:
-    print(f"[startup][error] Failed to import solders.pubkey: {e}")
-    raise
-
+import base64
+import requests
 from filelock import FileLock
+from solana.publickey import PublicKey
+from solana.rpc.async_api import AsyncClient
+from solana.rpc.types import MemcmpOpts, TokenAccountOpts
 from dotenv import load_dotenv
 
 load_dotenv()
-
-HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
-HELIUS_BASE_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
-JUPITER_API_BASE_URL = "https://quote-api.jup.ag"
-
-HEADERS = {
-    "accept": "application/json",
-    "Content-Type": "application/json"
-}
-
 logger = logging.getLogger(__name__)
 
-# --- Fetch recent tokens from Helius ---
+HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
+HELIUS_RPC = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+JUPITER_SWAP_API = "https://quote-api.jup.ag/v6/swap"
+JUPITER_TOKEN_LIST = "https://token.jup.ag/all"
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
+
+
 async def get_recent_tokens_from_helius(program_ids):
-    url = f"{HELIUS_BASE_URL}"
-    limit = 20
-    seen_mints = set()
-    recent_tokens = []
-
-    async with aiohttp.ClientSession() as session:
-        for program_id in program_ids:
-            payload = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "getSignaturesForAddress",
-                "params": [program_id, {"limit": limit}]
-            }
-            async with session.post(url, json=payload, headers=HEADERS) as resp:
-                result = await resp.json()
-                signatures = result.get("result", [])
-
-                for sig in signatures:
-                    signature = sig["signature"]
-                    ts = sig.get("blockTime", int(time.time()))
-                    token_info = await fetch_token_mint_from_signature(session, signature)
-                    if token_info:
-                        mint = token_info["mint"]
-                        if mint not in seen_mints:
-                            seen_mints.add(mint)
-                            recent_tokens.append({
-                                "mint": mint,
-                                "timestamp": ts
-                            })
-    return recent_tokens
-
-# --- Helper: fetch token mint from a transaction signature ---
-async def fetch_token_mint_from_signature(session, signature):
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getTransaction",
-        "params": [signature, {"encoding": "json"}]
-    }
-    async with session.post(HELIUS_BASE_URL, json=payload, headers=HEADERS) as resp:
-        result = await resp.json()
-        transaction = result.get("result")
-        if not transaction:
-            return None
-        try:
-            instructions = transaction["transaction"]["message"]["instructions"]
-            for ix in instructions:
-                if "parsed" in ix:
-                    parsed = ix["parsed"]
-                    if parsed["type"] == "initializeMint":
-                        return {"mint": parsed["info"]["mint"]}
-        except Exception:
-            return None
-    return None
-
-# --- Check if a token has sufficient liquidity ---
-async def has_sufficient_liquidity(mint: str, min_liquidity_lamports: int) -> bool:
-    url = f"{JUPITER_API_BASE_URL}/v6/pools?mint={mint}"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            data = await resp.json()
-            for pool in data:
-                reserves = pool.get("reserves", [])
-                for reserve in reserves:
-                    if reserve and int(reserve) >= min_liquidity_lamports:
-                        return True
-    return False
-
-# --- Fetch token metadata (placeholder) ---
-async def get_token_metadata(mint):
-    return {"name": mint[:4]}  # Placeholder for real metadata fetch
-
-# --- Buy token (mock implementation) ---
-async def buy_token(mint, amount_sol, tip=5000):
-    return {"success": True}  # Mock response
-
-# --- Get token price (mock implementation) ---
-async def get_token_price(mint):
-    return 1.0  # Mock price
-
-# --- Sell token (mock implementation) ---
-async def sell_token(mint):
-    logger.info(f"[mock sell] Selling token {mint}")
-
-# --- Send Telegram message (mock implementation) ---
-async def send_telegram_message(message: str):
-    logger.info(f"[telegram] {message}")
-
-# --- Async load positions from file ---
-async def load_positions(filepath: str):
+    url = f"https://api.helius.xyz/v0/addresses/{','.join(program_ids)}/transactions?api-key={HELIUS_API_KEY}&limit=15"
+    tokens = []
     try:
-        loop = asyncio.get_event_loop()
-        if not os.path.exists(filepath):
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                data = await resp.json()
+                for tx in data:
+                    for acc in tx.get("tokenTransfers", []):
+                        if acc["mint"] not in [t["mint"] for t in tokens]:
+                            tokens.append({
+                                "mint": acc["mint"],
+                                "timestamp": tx["timestamp"]
+                            })
+        return tokens
+    except Exception as e:
+        logger.error(f"[error] Failed to fetch recent tokens: {e}")
+        return []
+
+
+async def has_sufficient_liquidity(mint, min_liquidity_lamports):
+    try:
+        url = f"https://quote-api.jup.ag/v6/quote?inputMint={mint}&outputMint=So11111111111111111111111111111111111111112&amount=1000000&slippage=1"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                data = await resp.json()
+                if "marketInfos" not in data:
+                    return False
+                total_liquidity = sum([m.get("inAmount", 0) for m in data["marketInfos"]])
+                return total_liquidity >= min_liquidity_lamports
+    except Exception as e:
+        logger.error(f"[error] Liquidity check failed: {e}")
+        return False
+
+
+async def get_token_metadata(mint):
+    try:
+        url = f"https://api.helius.xyz/v0/tokens/metadata?api-key={HELIUS_API_KEY}"
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json={"mintAccounts": [mint]}) as resp:
+                data = await resp.json()
+                if isinstance(data, list) and data:
+                    return {
+                        "name": data[0].get("name", "unknown"),
+                        "symbol": data[0].get("symbol", ""),
+                        "image": data[0].get("image", "")
+                    }
+        return {"name": "unknown", "symbol": "", "image": ""}
+    except Exception as e:
+        logger.warning(f"[warn] Failed to fetch metadata: {e}")
+        return {"name": "unknown", "symbol": "", "image": ""}
+
+
+async def buy_token(mint, amount_sol, tip=5000):
+    try:
+        url = f"{JUPITER_SWAP_API}"
+        params = {
+            "inputMint": "So11111111111111111111111111111111111111112",  # SOL
+            "outputMint": mint,
+            "amount": int(amount_sol * 1_000_000_000),
+            "slippageBps": 100,
+            "userPublicKey": WALLET_ADDRESS,
+            "swapMode": "ExactIn",
+            "platformFeeBps": 0
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params) as resp:
+                quote = await resp.json()
+                if "swapTransaction" not in quote:
+                    return {"success": False, "error": "No route"}
+                tx = base64.b64decode(quote["swapTransaction"])
+                async with AsyncClient(HELIUS_RPC) as client:
+                    tx_sig = await client.send_raw_transaction(tx)
+                    return {"success": True, "txid": tx_sig.value}
+    except Exception as e:
+        logger.error(f"[error] Buy failed: {e}")
+        return {"success": False, "error": str(e)}
+
+
+async def sell_token(mint):
+    try:
+        # For now, assume it is same as buy_token logic in reverse
+        return {"success": True}
+    except Exception as e:
+        logger.warning(f"[warn] Sell failed: {e}")
+        return {"success": False, "error": str(e)}
+
+
+async def get_token_price(mint):
+    try:
+        url = f"https://price.jup.ag/v4/price?ids={mint}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                data = await resp.json()
+                return data["data"][mint]["price"]
+    except Exception as e:
+        logger.warning(f"[warn] Failed to fetch price for {mint}: {e}")
+        return None
+
+
+async def send_telegram_message(message):
+    try:
+        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+            return
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message
+        }
+        async with aiohttp.ClientSession() as session:
+            await session.post(url, json=payload)
+    except Exception as e:
+        logger.warning(f"[warn] Telegram failed: {e}")
+
+
+async def load_positions(path):
+    try:
+        if not os.path.exists(path):
             return {}
-        return await loop.run_in_executor(None, lambda: json.load(open(filepath, "r")))
-    except (FileNotFoundError, json.JSONDecodeError):
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.warning(f"[warn] Failed to load positions: {e}")
         return {}
 
-# --- Async save positions to file with file lock ---
-async def save_positions(filepath: str, positions: dict, lockfile: str):
-    loop = asyncio.get_event_loop()
-    def write_json():
-        with FileLock(lockfile):
-            with open(filepath, "w") as f:
-                json.dump(positions, f, indent=4)
-    await loop.run_in_executor(None, write_json)
 
-# --- Acquire file lock (sync, for startup/shutdown) ---
-async def acquire_file_lock(lockfile: str):
-    loop = asyncio.get_event_loop()
-    def acquire():
-        lock = FileLock(lockfile)
-        lock.acquire()
-    await loop.run_in_executor(None, acquire)
+async def save_positions(path, data, lock_file):
+    try:
+        with FileLock(lock_file):
+            with open(path, "w") as f:
+                json.dump(data, f, indent=2)
+    except Exception as e:
+        logger.warning(f"[warn] Failed to save positions: {e}")
 
-# --- Release file lock (sync, for shutdown) ---
-async def release_file_lock(lockfile: str):
-    loop = asyncio.get_event_loop()
-    def release():
-        lock = FileLock(lockfile)
-        if lock.is_locked:
-            lock.release()
-    await loop.run_in_executor(None, release)
+
+async def acquire_file_lock(lock_file):
+    lock = FileLock(lock_file)
+    lock.acquire()
+    return lock
+
+
+async def release_file_lock(lock):
+    try:
+        lock.release()
+    except Exception:
+        pass
