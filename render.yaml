@@ -1,9 +1,3 @@
-services:
-  - type: web
-    name: solana-sniper-bot
-    env: python
-    buildCommand: pip install -r requirements.txt && npm install
-    startCommand: python bot.py
-    plan: free
-    autoDeploy: true
-    region: oregon
+build:
+  environment:
+    PYTHON_VERSION: 3.11
