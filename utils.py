@@ -112,3 +112,20 @@ async def buy_token(mint, amount_sol):
     except Exception as e:
         logger.warning(f"[buy_token] Failed to buy {mint}: {e}")
         return {"success": False, "error": str(e)}
+
+async def get_token_price(mint):
+    try:
+        url = f"https://price.jup.ag/v4/price?ids={mint}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                data = await resp.json()
+
+        price_data = data.get("data", {}).get(mint)
+        if price_data:
+            return price_data["price"]
+        else:
+            logger.warning(f"[get_token_price] No price data for {mint}")
+            return None
+    except Exception as e:
+        logger.warning(f"[get_token_price] Failed to fetch price for {mint}: {e}")
+        return None
