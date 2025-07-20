@@ -1,3 +1,26 @@
-build:
-  environment:
-    PYTHON_VERSION: 3.11
+services:
+  - type: web
+    name: solana-sniper-bot
+    runtime: python
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.8
+      - key: PIP_NO_CACHE_DIR
+        value: "false"
+      - key: MIN_LIQUIDITY_LAMPORTS
+        value: "20000000000"
+      # Add other environment variables below as needed
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: HELIUS_API_KEY
+        sync: false
+      - key: RPC_URL
+        sync: false
+      - key: PRIVATE_KEY
+        sync: false
