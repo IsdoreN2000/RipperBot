@@ -12,15 +12,23 @@ from solana.rpc.async_api import AsyncClient
 from solana.rpc.types import TxOpts
 import asyncio
 import traceback
+from filelock import FileLock
 
 logging.basicConfig(level=logging.INFO)
 logging.info("=== Bot started successfully ===")
 
-MIN_TOKEN_AGE_SECONDS = 0         # Minimum age: 0 seconds (just listed)
-MAX_TOKEN_AGE_SECONDS = 3600      # Maximum age: 1 hour (3600 seconds)
-MIN_LIQUIDITY_LAMPORTS = 20 * 1_000_000_000  # 20 SOL
+# --- Configurable Parameters ---
+MIN_TOKEN_AGE_SECONDS = int(os.getenv("MIN_TOKEN_AGE_SECONDS", 0))
+MAX_TOKEN_AGE_SECONDS = int(os.getenv("MAX_TOKEN_AGE_SECONDS", 3600))
+MIN_LIQUIDITY_LAMPORTS = int(os.getenv("MIN_LIQUIDITY_LAMPORTS", 20 * 1_000_000_000))
+POSITIONS_FILE = os.getenv("POSITIONS_FILE", "positions.json")
+POSITIONS_LOCK_FILE = POSITIONS_FILE + ".lock"
+JUPITER_MAX_RETRIES = int(os.getenv("JUPITER_MAX_RETRIES", 3))
+JUPITER_BACKOFF_BASE = float(os.getenv("JUPITER_BACKOFF_BASE", 2.0))
+JUPITER_BACKOFF_MAX = float(os.getenv("JUPITER_BACKOFF_MAX", 10.0))
+SOLANA_COMMITMENT = os.getenv("SOLANA_COMMITMENT", "finalized")
+SOLANA_CONFIRM_TIMEOUT = int(os.getenv("SOLANA_CONFIRM_TIMEOUT", 30))
 
-# --- ENVIRONMENT VARIABLES & VALIDATION ---
 REQUIRED_ENVS = [
     "PRIVATE_KEY", "HELIUS_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"
 ]
@@ -45,40 +53,55 @@ STOP_LOSS = float(os.getenv("STOP_LOSS", 0.7))
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 HELIUS_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
-PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+
+PUMP_PROGRAM_IDS = [
+    "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",  # Pump.fun
+    "BUNKU1mDhD6GNnpHJRZAZpEj3nGoqVZZe8RvAdTaLyoz"   # Bunk.fun
+]
+
 JUPITER_QUOTE_URL = "https://quote-api.jup.ag/v6/quote"
 JUPITER_SWAP_URL = "https://quote-api.jup.ag/v6/swap"
 WRAPPED_SOL = "So11111111111111111111111111111111111111112"
-POSITIONS_FILE = "positions.json"
 
-# --- POSITION PERSISTENCE ---
+# --- Helper Functions ---
+
+def get_current_utc_timestamp():
+    return int(datetime.now(timezone.utc).timestamp())
+
+def escape_markdown(text):
+    # Escapes Telegram Markdown special characters
+    for char in ('_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!'):
+        text = text.replace(char, f'\\{char}')
+    return text
+
 def load_positions():
     if os.path.exists(POSITIONS_FILE):
         try:
-            with open(POSITIONS_FILE, "r") as f:
-                return json.load(f)
+            with FileLock(POSITIONS_LOCK_FILE, timeout=5):
+                with open(POSITIONS_FILE, "r") as f:
+                    return json.load(f)
         except Exception as e:
             logging.warning(f"Failed to load positions: {e}")
     return {}
 
 def save_positions(positions):
     try:
-        with open(POSITIONS_FILE, "w") as f:
-            json.dump(positions, f)
+        with FileLock(POSITIONS_LOCK_FILE, timeout=5):
+            with open(POSITIONS_FILE, "w") as f:
+                json.dump(positions, f)
     except Exception as e:
         logging.warning(f"Failed to save positions: {e}")
 
-positions = load_positions()  # mint -> {buy_price, time}
+positions = load_positions()
 
-# --- TELEGRAM ---
 async def send_telegram_message(message, session):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown",
+        "text": escape_markdown(message),
+        "parse_mode": "MarkdownV2",
         "disable_web_page_preview": True
     }
     for attempt in range(3):
@@ -94,19 +117,38 @@ async def send_telegram_message(message, session):
             logging.error(f"[telegram] {e}")
             await asyncio.sleep(2)
 
-# --- HELIUS & JUPITER HELPERS ---
+async def jupiter_get(session, url, params):
+    for attempt in range(JUPITER_MAX_RETRIES):
+        try:
+            async with session.get(url, params=params, timeout=10) as resp:
+                data = await resp.json()
+                if resp.status == 429:
+                    backoff = min(JUPITER_BACKOFF_BASE ** attempt, JUPITER_BACKOFF_MAX)
+                    logging.warning(f"[jupiter] Rate limited, backoff {backoff}s")
+                    await asyncio.sleep(backoff)
+                    continue
+                return data
+        except Exception as e:
+            backoff = min(JUPITER_BACKOFF_BASE ** attempt, JUPITER_BACKOFF_MAX)
+            logging.warning(f"[jupiter] Error: {e}, backoff {backoff}s")
+            await asyncio.sleep(backoff)
+    return {}
+
 async def get_recent_signatures(session, limit=10):
-    payload = {
-        "jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
-        "params": [PUMP_PROGRAM_ID, {"limit": limit}]
-    }
-    try:
-        async with session.post(HELIUS_URL, json=payload, timeout=10) as resp:
-            result = await resp.json()
-            return [tx["signature"] for tx in result.get("result", [])]
-    except Exception as e:
-        logging.warning(f"[signatures] {e}")
-        return []
+    all_signatures = []
+    for program_id in PUMP_PROGRAM_IDS:
+        payload = {
+            "jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
+            "params": [program_id, {"limit": limit}]
+        }
+        try:
+            async with session.post(HELIUS_URL, json=payload, timeout=10) as resp:
+                result = await resp.json()
+                sigs = [tx["signature"] for tx in result.get("result", [])]
+                all_signatures.extend(sigs)
+        except Exception as e:
+            logging.warning(f"[signatures] {program_id}: {e}")
+    return list(set(all_signatures))
 
 async def get_token_mints_from_tx(session, signature):
     payload = {
@@ -142,29 +184,17 @@ async def has_liquidity(session, mint):
         "slippageBps": int(SLIPPAGE * 100),
         "onlyDirectRoutes": "false"
     }
-    try:
-        async with session.get(JUPITER_QUOTE_URL, params=params, timeout=10) as resp:
-            data = await resp.json()
-            if resp.status != 200:
-                logging.warning(f"[has_liquidity] Error {resp.status}: {data}")
-                return False
-            routes = data.get("data", [])
-            if not routes:
-                logging.info(f"[has_liquidity] {mint} no routes found")
-                return False
-            best_route = routes[0]
-            out_amount = int(best_route.get("outAmount", 0))
-            logging.info(f"[has_liquidity] {mint} out_amount: {out_amount}")
-            if out_amount < MIN_LIQUIDITY_LAMPORTS:
-                logging.info(f"[liquidity] {mint} liquidity {out_amount} too low (< 20 SOL)")
-                return False
-            return True
-    except Exception as e:
-        logging.warning(f"[has_liquidity] {e}")
+    data = await jupiter_get(session, JUPITER_QUOTE_URL, params)
+    routes = data.get("data", [])
+    if not routes:
+        logging.info(f"[has_liquidity] {mint} no routes found")
         return False
+    best_route = routes[0]
+    out_amount = int(best_route.get("outAmount", 0))
+    logging.info(f"[has_liquidity] {mint} out_amount: {out_amount}")
+    return out_amount >= MIN_LIQUIDITY_LAMPORTS
 
 async def get_token_creation_time(session, mint):
-    # 1. Try getAccountInfo
     payload = {
         "jsonrpc": "2.0", "id": 1, "method": "getAccountInfo",
         "params": [mint, {"encoding": "jsonParsed"}]
@@ -178,7 +208,6 @@ async def get_token_creation_time(session, mint):
     except Exception as e:
         logging.warning(f"[token_time] primary failed: {e}")
 
-    # 2. Fallback: get first signature, then getBlockTime from slot
     payload = {
         "jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
         "params": [mint, {"limit": 1}]
@@ -209,9 +238,8 @@ async def get_swap_route(session, input_mint, output_mint, amount):
         "slippageBps": int(SLIPPAGE * 100),
         "onlyDirectRoutes": "false"
     }
-    async with session.get(JUPITER_QUOTE_URL, params=params, timeout=10) as resp:
-        data = await resp.json()
-        return data.get("data", [None])[0]
+    data = await jupiter_get(session, JUPITER_QUOTE_URL, params)
+    return data.get("data", [None])[0]
 
 async def get_swap_transaction(session, route, user_public_key):
     payload = {
@@ -229,10 +257,16 @@ async def execute_swap(swap_txn_b64, client):
     txn = VersionedTransaction.deserialize(txn_bytes)
     txn.sign([keypair])
     sig = await client.send_raw_transaction(txn.serialize(), opts=TxOpts(skip_preflight=True))
-    await client.confirm_transaction(sig.value)
+    # Enhanced: Wait for confirmation with commitment and timeout
+    try:
+        await asyncio.wait_for(
+            client.confirm_transaction(sig.value, commitment=SOLANA_COMMITMENT),
+            timeout=SOLANA_CONFIRM_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        logging.warning(f"[solana] Confirmation timeout for {sig.value}")
     return sig.value
 
-# --- BUY/SELL LOGIC ---
 async def execute_buy(session, mint, client):
     route = await get_swap_route(session, WRAPPED_SOL, mint, int(BUY_AMOUNT_SOL * 1_000_000_000))
     if not route:
@@ -240,7 +274,7 @@ async def execute_buy(session, mint, client):
     swap_txn_b64 = await get_swap_transaction(session, route, str(keypair.pubkey()))
     sig = await execute_swap(swap_txn_b64, client)
     price = float(route["outAmount"]) / float(route["inAmount"])
-    positions[mint] = {"buy_price": price, "time": datetime.now(timezone.utc).timestamp()}
+    positions[mint] = {"buy_price": price, "time": get_current_utc_timestamp()}
     save_positions(positions)
     await send_telegram_message(f"✅ Bought `{mint}`\nTx: https://solscan.io/tx/{sig}", session)
     return True, sig
@@ -255,11 +289,10 @@ async def check_for_sell(session, client):
         if pnl >= PROFIT_TARGET or pnl <= STOP_LOSS:
             swap_txn_b64 = await get_swap_transaction(session, route, str(keypair.pubkey()))
             sig = await execute_swap(swap_txn_b64, client)
-            await send_telegram_message(f"💰 Sold `{mint}` at {round(pnl,2)}x\nTx: https://solscan.io/tx/{sig}", session)
+            await send_telegram_message(f"💰 Sold `{mint}` at {round(pnl, 2)}x\nTx: https://solscan.io/tx/{sig}", session)
             del positions[mint]
             save_positions(positions)
 
-# --- MAIN LOOP WITH DEBUG LOGGING ---
 async def main_loop():
     async with aiohttp.ClientSession() as session:
         async with AsyncClient(RPC_URL) as client:
@@ -272,31 +305,21 @@ async def main_loop():
                         if not mint or mint == WRAPPED_SOL or mint in positions:
                             continue
                         logging.info(f"[check] {mint}")
-
                         creation_time = await get_token_creation_time(session, mint)
-                        logging.info(f"[debug] {mint} creation_time: {creation_time}")
                         if not creation_time:
-                            logging.info(f"[skip] {mint} has no block_time (API returned None)")
+                            logging.info(f"[skip] {mint} has no block_time")
                             continue
-
-                        now = int(datetime.now(timezone.utc).timestamp())
+                        now = get_current_utc_timestamp()
                         age = now - creation_time
-                        logging.info(f"[debug] {mint} age: {age}s")
-
                         if not (MIN_TOKEN_AGE_SECONDS <= age <= MAX_TOKEN_AGE_SECONDS):
-                            logging.info(f"[skip] {mint} age: {age}s (outside 0-1h window)")
+                            logging.info(f"[skip] {mint} age: {age}s")
                             continue
-
                         liquidity = await has_liquidity(session, mint)
-                        logging.info(f"[debug] {mint} liquidity: {liquidity}")
                         if liquidity:
                             try:
                                 success, _ = await execute_buy(session, mint, client)
                                 if success:
-                                    logging.info(f"[buy] {mint} bought successfully")
                                     await asyncio.sleep(2)
-                                else:
-                                    logging.info(f"[buy] {mint} buy attempt failed")
                             except Exception as buy_exc:
                                 logging.error(f"[buy] {mint} buy error: {buy_exc}")
                         else:
@@ -307,10 +330,11 @@ async def main_loop():
                     logging.error(f"[loop] {e}\n{traceback.format_exc()}")
                     await asyncio.sleep(5)
 
-# --- GRACEFUL SHUTDOWN ---
 def shutdown_handler(loop):
     logging.info("Shutting down gracefully...")
     save_positions(positions)
+    for task in asyncio.all_tasks(loop):
+        task.cancel()
     loop.stop()
 
 if __name__ == "__main__":
