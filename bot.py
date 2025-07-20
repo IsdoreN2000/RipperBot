@@ -7,6 +7,7 @@ import sys
 import time
 from decimal import Decimal
 
+# Ensure all dependencies are present
 try:
     import aiohttp
 except Exception as e:
@@ -14,7 +15,7 @@ except Exception as e:
     sys.exit(1)
 
 try:
-    from solders.pubkey import Pubkey
+    from solders.pubkey import Pubkey  # Use solders for Solana public key handling
 except Exception as e:
     print(f"[startup][error] Failed to import solders.pubkey: {e}")
     sys.exit(1)
