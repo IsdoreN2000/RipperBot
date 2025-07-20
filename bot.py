@@ -6,6 +6,17 @@ import signal
 import sys
 import time
 from decimal import Decimal
+
+# --- Dependency Check: solana and PublicKey ---
+try:
+    import solana
+    from solana.publickey import PublicKey
+    print(f"[startup] solana version: {solana.__version__}")
+    print("[startup] PublicKey import successful!")
+except Exception as e:
+    print(f"[startup][error] solana or PublicKey import failed: {e}")
+    sys.exit(1)
+
 from dotenv import load_dotenv
 from utils import (
     get_recent_tokens_from_helius,
@@ -147,4 +158,5 @@ async def main():
         await release_file_lock(lock_file)
 
 if __name__ == "__main__":
+    logger.info("Launching Solana trading bot...")
     asyncio.run(main())
