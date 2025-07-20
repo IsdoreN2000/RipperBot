@@ -53,3 +53,11 @@ async def get_recent_tokens_from_helius(program_ids):
         except Exception as e:
             logger.warning(f"Error fetching tokens for {program_id}: {e}")
     return tokens
+
+def has_sufficient_liquidity(token, amount):
+    """
+    Placeholder function to check if a token has sufficient liquidity.
+    Replace this logic with your actual liquidity check.
+    """
+    # TODO: Implement actual liquidity check logic
+    return True
