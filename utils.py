@@ -37,7 +37,7 @@ async def get_recent_tokens_from_helius(program_ids, limit=10):
         headers = {"Content-Type": "application/json"}
         now = int(time.time())
         for program_id in program_ids:
-            url = f"https://mainnet.helius.xyz/v0/addresses/{program_id}/transactions?api-key={HELIUS_API_KEY}&limit={limit}"
+            url = f"https://api.helius.xyz/v0/addresses/{program_id}/transactions?api-key={HELIUS_API_KEY}&limit={limit}"
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, headers=headers) as resp:
                     data = await resp.json()
