@@ -8,10 +8,16 @@ from dotenv import load_dotenv
 load_dotenv()
 logger = logging.getLogger(__name__)
 
+# === Config ===
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
 JUPITER_BASE_URL = "https://quote-api.jup.ag"
+
+# === Program IDs ===
+PUMP_FUN_PROGRAM = "6u6QbZvcj5JkGFsKfJQkRXiRwz9wrDxQ6Uijvqx6uXwp"
+BUNK_FUN_PROGRAM = "BUNKU1mDhD6GNnpHJRZAZpEj3nGoqVZZe8RvAdTaLyoz"
+PROGRAM_IDS = [PUMP_FUN_PROGRAM, BUNK_FUN_PROGRAM]
 
 # === Telegram ===
 
@@ -31,15 +37,20 @@ async def send_telegram_message(message: str):
 
 # === Helius token fetch ===
 
-async def get_recent_tokens_from_helius(program_ids, limit=10):
+async def get_recent_tokens_from_helius(program_ids=PROGRAM_IDS, limit=10):
     tokens = []
     try:
         headers = {"Content-Type": "application/json"}
         now = int(time.time())
         for program_id in program_ids:
-            url = f"https://api.helius.xyz/v0/addresses/{program_id}/transactions?api-key={HELIUS_API_KEY}&limit={limit}"
+            url = f"https://mainnet.helius.xyz/v0/addresses/{program_id}/transactions?api-key={HELIUS_API_KEY}&limit={limit}"
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, headers=headers) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"Helius API status: {resp.status}")
+                        raw = await resp.text()
+                        logger.warning(f"Helius API raw response: {raw}")
+                        continue
                     data = await resp.json()
                     if not isinstance(data, list):
                         logger.warning(f"Unexpected data format (expected list): {data}")
@@ -102,7 +113,7 @@ async def get_token_metadata(mint):
 
 async def buy_token(mint, amount_sol):
     try:
-        # Replace this stub with real buy logic if using Jupiter or Phoenix routing
+        # Replace with actual buy logic
         logger.info(f"[stub] Simulating buy of {amount_sol} SOL for {mint}")
         return {"success": True, "txid": "dummy_txid"}
     except Exception as e:
@@ -113,14 +124,14 @@ async def buy_token(mint, amount_sol):
 
 async def sell_token(mint, amount_token=None):
     try:
-        # Replace this stub with real sell logic using Jupiter swap
+        # Replace with actual sell logic
         logger.info(f"[stub] Simulating sell of {mint}")
         return {"success": True, "txid": "dummy_txid"}
     except Exception as e:
         logger.warning(f"[sell] failed: {e}")
         return {"success": False, "error": str(e)}
 
-# === Get price ===
+# === Get token price ===
 
 async def get_token_price(mint):
     try:
