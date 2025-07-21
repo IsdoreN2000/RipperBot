@@ -2,6 +2,7 @@ import os
 import aiohttp
 import logging
 import time
+import asyncio
 from solders.pubkey import Pubkey
 from dotenv import load_dotenv
 
@@ -19,8 +20,24 @@ PUMP_FUN_PROGRAM = "6u6QbZvcj5JkGFsKfJQkRXiRwz9wrDxQ6Uijvqx6uXwp"
 BUNK_FUN_PROGRAM = "BUNKU1mDhD6GNnpHJRZAZpEj3nGoqVZZe8RvAdTaLyoz"
 PROGRAM_IDS = [PUMP_FUN_PROGRAM, BUNK_FUN_PROGRAM]
 
-# === Telegram ===
+# === Helper: Retry logic for network requests ===
+async def fetch_with_retries(session, url, headers=None, retries=3, delay=2):
+    for attempt in range(retries):
+        try:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                else:
+                    logger.warning(f"HTTP {resp.status} for {url}")
+                    raw = await resp.text()
+                    logger.warning(f"Raw response: {raw}")
+        except Exception as e:
+            logger.warning(f"Attempt {attempt+1} failed for {url}: {e}")
+        await asyncio.sleep(delay)
+    logger.warning(f"All {retries} attempts failed for {url}")
+    return None
 
+# === Telegram ===
 async def send_telegram_message(message: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("Telegram credentials not set")
@@ -36,81 +53,62 @@ async def send_telegram_message(message: str):
         logger.warning(f"[telegram] error: {e}")
 
 # === Helius token fetch ===
-
 async def get_recent_tokens_from_helius(program_ids=PROGRAM_IDS, limit=10):
     tokens = []
-    try:
-        headers = {"Content-Type": "application/json"}
-        now = int(time.time())
+    headers = {"Content-Type": "application/json"}
+    now = int(time.time())
+    async with aiohttp.ClientSession() as session:
         for program_id in program_ids:
             url = f"https://mainnet.helius.xyz/v0/addresses/{program_id}/transactions?api-key={HELIUS_API_KEY}&limit={limit}"
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=headers) as resp:
-                    if resp.status != 200:
-                        logger.warning(f"Helius API status: {resp.status}")
-                        raw = await resp.text()
-                        logger.warning(f"Helius API raw response: {raw}")
+            data = await fetch_with_retries(session, url, headers)
+            if not data:
+                continue
+            if not isinstance(data, list):
+                logger.warning(f"Unexpected data format (expected list): {data}")
+                continue
+            for tx in data:
+                try:
+                    mint = None
+                    for inst in tx.get("instructions", []):
+                        if "mint" in inst and isinstance(inst["mint"], str):
+                            mint = inst["mint"]
+                            break
+                    if not mint:
                         continue
-                    data = await resp.json()
-                    if not isinstance(data, list):
-                        logger.warning(f"Unexpected data format (expected list): {data}")
-                        continue
-                    for tx in data:
-                        try:
-                            mint = None
-                            for inst in tx.get("instructions", []):
-                                if "mint" in inst and isinstance(inst["mint"], str):
-                                    mint = inst["mint"]
-                                    break
-                            if not mint:
-                                continue
-                            tokens.append({
-                                "mint": mint,
-                                "timestamp": tx.get("timestamp", now)
-                            })
-                        except Exception as e:
-                            logger.warning(f"Error parsing transaction: {e}")
-    except Exception as e:
-        logger.warning(f"Helius token fetch failed: {e}")
+                    tokens.append({
+                        "mint": mint,
+                        "timestamp": tx.get("timestamp", now)
+                    })
+                except Exception as e:
+                    logger.warning(f"Error parsing transaction: {e}")
     return tokens
 
 # === Liquidity check ===
-
 async def has_sufficient_liquidity(mint, min_liquidity_lamports):
-    try:
-        url = f"{JUPITER_BASE_URL}/v6/pools?mint={mint}"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as resp:
-                if resp.status != 200:
-                    logger.warning(f"[liquidity] HTTP {resp.status}")
-                    return False
-                data = await resp.json()
-                for pool in data.get("pools", []):
-                    if int(pool.get("lp_fee_bps", 0)) > 100:  # filter scammy pools
-                        continue
-                    base_liq = int(pool.get("base_liquidity", 0))
-                    quote_liq = int(pool.get("quote_liquidity", 0))
-                    if base_liq >= min_liquidity_lamports or quote_liq >= min_liquidity_lamports:
-                        return True
-    except Exception as e:
-        logger.warning(f"[liquidity] check failed: {e}")
+    url = f"{JUPITER_BASE_URL}/v6/pools?mint={mint}"
+    async with aiohttp.ClientSession() as session:
+        data = await fetch_with_retries(session, url)
+        if not data:
+            return False
+        for pool in data.get("pools", []):
+            if int(pool.get("lp_fee_bps", 0)) > 100:  # filter scammy pools
+                continue
+            base_liq = int(pool.get("base_liquidity", 0))
+            quote_liq = int(pool.get("quote_liquidity", 0))
+            if base_liq >= min_liquidity_lamports or quote_liq >= min_liquidity_lamports:
+                return True
     return False
 
 # === Token metadata ===
-
 async def get_token_metadata(mint):
-    try:
-        url = f"https://token.jup.ag/strict/{mint}"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-    except Exception as e:
-        logger.warning(f"[metadata] fetch failed: {e}")
+    url = f"https://token.jup.ag/strict/{mint}"
+    async with aiohttp.ClientSession() as session:
+        data = await fetch_with_retries(session, url)
+        if data:
+            return data
     return {"symbol": "Unknown"}
 
 # === Buy ===
-
 async def buy_token(mint, amount_sol):
     try:
         # Replace with actual buy logic
@@ -121,7 +119,6 @@ async def buy_token(mint, amount_sol):
         return {"success": False, "error": str(e)}
 
 # === Sell ===
-
 async def sell_token(mint, amount_token=None):
     try:
         # Replace with actual sell logic
@@ -132,19 +129,14 @@ async def sell_token(mint, amount_token=None):
         return {"success": False, "error": str(e)}
 
 # === Get token price ===
-
 async def get_token_price(mint):
-    try:
-        url = f"https://price.jup.ag/v4/price?ids={mint}"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as resp:
-                data = await resp.json()
-        price_data = data.get("data", {}).get(mint)
-        if price_data:
-            return price_data["price"]
-        else:
-            logger.warning(f"[price] No price for {mint}")
-            return None
-    except Exception as e:
-        logger.warning(f"[price] fetch error: {e}")
-        return None
+    url = f"https://price.jup.ag/v4/price?ids={mint}"
+    async with aiohttp.ClientSession() as session:
+        data = await fetch_with_retries(session, url)
+        if data:
+            price_data = data.get("data", {}).get(mint)
+            if price_data:
+                return price_data["price"]
+            else:
+                logger.warning(f"[price] No price for {mint}")
+    return None
