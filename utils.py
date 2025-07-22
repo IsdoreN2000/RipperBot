@@ -3,22 +3,27 @@ import aiohttp
 import json
 import logging
 import os
-from typing import List, Dict, Optional
+import signal
+from typing import List, Dict
 from collections import deque
+from dotenv import load_dotenv
+
+# === Load environment variables early ===
+load_dotenv()
 
 # === Configuration ===
 DBOTX_WS_URL = "wss://api-bot-v1.dbotx.com/trade/ws"
-DBOTX_API_KEY = os.getenv("DBOTX_API_KEY") or "YOUR_TEST_API_KEY"
+DBOTX_API_KEY = os.getenv("DBOTX_API_KEY")
+if not DBOTX_API_KEY:
+    raise ValueError("Missing DBOTX_API_KEY in environment variables.")
 MAX_TOKENS = 100
 
-JUPITER_BASE_URL = "https://quote-api.jup.ag"
-
+# === Logging Setup ===
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 detected_tokens = deque(maxlen=MAX_TOKENS)
 
-# --- DBotX WebSocket Listener ---
 async def listen_to_dbotx_trades(chain: str = "solana"):
     headers = {"X-API-KEY": DBOTX_API_KEY}
     backoff = 1
@@ -44,8 +49,7 @@ async def listen_to_dbotx_trades(chain: str = "solana"):
                                         "mint": data["token"],
                                         "symbol": data.get("symbol", ""),
                                         "amount": data.get("amount", 0),
-                                        "price": data.get("price", 0),
-                                        "timestamp": data.get("timestamp") or int(asyncio.get_event_loop().time())
+                                        "price": data.get("price", 0)
                                     }
                                     detected_tokens.append(token_info)
                                     logger.info(f"[ws] New token detected: {token_info}")
@@ -66,81 +70,25 @@ async def listen_to_dbotx_trades(chain: str = "solana"):
 def get_recent_tokens_from_dbotx(limit: int = 20) -> List[Dict]:
     return list(detected_tokens)[-limit:] if detected_tokens else []
 
-# --- Utility: Retry logic for network requests ---
-async def fetch_with_retries(session, url, headers=None, retries=3, delay=2):
-    for attempt in range(retries):
-        try:
-            async with session.get(url, headers=headers) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                else:
-                    logger.warning(f"HTTP {resp.status} for {url}")
-                    raw = await resp.text()
-                    logger.warning(f"Raw response: {raw}")
-        except Exception as e:
-            logger.warning(f"Attempt {attempt+1} failed for {url}: {e}")
-        await asyncio.sleep(delay)
-    logger.warning(f"All {retries} attempts failed for {url}")
-    return None
-
-# --- Liquidity check ---
-async def has_sufficient_liquidity(mint, min_liquidity_lamports):
-    url = f"{JUPITER_BASE_URL}/v6/pools?mint={mint}"
-    async with aiohttp.ClientSession() as session:
-        data = await fetch_with_retries(session, url)
-        if not data:
-            return False
-        for pool in data.get("pools", []):
-            if int(pool.get("lp_fee_bps", 0)) > 100:
-                continue
-            base_liq = int(pool.get("base_liquidity", 0))
-            quote_liq = int(pool.get("quote_liquidity", 0))
-            if base_liq >= min_liquidity_lamports or quote_liq >= min_liquidity_lamports:
-                return True
-    return False
-
-# --- Token metadata ---
-async def get_token_metadata(mint):
-    url = f"https://token.jup.ag/strict/{mint}"
-    async with aiohttp.ClientSession() as session:
-        data = await fetch_with_retries(session, url)
-        if data:
-            return data
-    return {"symbol": "Unknown"}
-
-# --- Buy (stub) ---
-async def buy_token(mint, amount_sol):
+async def main():
+    listener_task = asyncio.create_task(listen_to_dbotx_trades(chain="solana"))
     try:
-        logger.info(f"[stub] Simulating buy of {amount_sol} SOL for {mint}")
-        return {"success": True, "txid": "dummy_txid"}
-    except Exception as e:
-        logger.warning(f"[buy] failed: {e}")
-        return {"success": False, "error": str(e)}
-
-# --- Sell (stub) ---
-async def sell_token(mint, amount_token=None):
-    try:
-        logger.info(f"[stub] Simulating sell of {mint}")
-        return {"success": True, "txid": "dummy_txid"}
-    except Exception as e:
-        logger.warning(f"[sell] failed: {e}")
-        return {"success": False, "error": str(e)}
-
-# --- Get token price ---
-async def get_token_price(mint):
-    url = f"https://price.jup.ag/v4/price?ids={mint}"
-    async with aiohttp.ClientSession() as session:
-        data = await fetch_with_retries(session, url)
-        if data:
-            price_data = data.get("data", {}).get(mint)
-            if price_data:
-                return price_data["price"]
+        while True:
+            await asyncio.sleep(10)
+            recent = get_recent_tokens_from_dbotx()
+            if recent:
+                logger.info(f"Recent tokens: {recent}")
             else:
-                logger.warning(f"[price] No price for {mint}")
-    return None
+                logger.info("No tokens detected yet.")
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+        listener_task.cancel()
+        await listener_task
 
-# --- Telegram notification (stub) ---
-async def send_telegram_message(message: str):
-    logger.info(f"[telegram] {message}")
+def shutdown():
+    logger.info("Received shutdown signal.")
+    raise KeyboardInterrupt
 
-# --- END OF UTILS.PY ---
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, lambda s, f: shutdown())
+    asyncio.run(main())
