@@ -7,7 +7,6 @@ import sys
 import time
 from decimal import Decimal
 
-# Ensure all dependencies are present
 try:
     import aiohttp
 except Exception as e:
@@ -15,20 +14,21 @@ except Exception as e:
     sys.exit(1)
 
 try:
-    from solders.pubkey import Pubkey  # Use solders for Solana public key handling
+    from solders.pubkey import Pubkey
 except Exception as e:
     print(f"[startup][error] Failed to import solders.pubkey: {e}")
     sys.exit(1)
 
 from dotenv import load_dotenv
 from utils import (
-    get_recent_tokens_from_helius,
+    get_recent_tokens_from_dbotx,
     has_sufficient_liquidity,
     get_token_metadata,
     buy_token,
     get_token_price,
     sell_token,
-    send_telegram_message
+    send_telegram_message,
+    listen_to_dbotx_trades
 )
 
 load_dotenv()
@@ -43,10 +43,6 @@ PROFIT_TARGET = float(os.getenv("PROFIT_TARGET", 2.0))  # 2x
 STOP_LOSS = float(os.getenv("STOP_LOSS", 0.5))          # 0.5x
 POSITION_FILE = "positions.json"
 
-PUMP_PROGRAM_ID = "G8ZbPXVwYhJcwhnXQpiN91n5PzFhHkHE7XQpHvVGh9v4"
-BUNK_PROGRAM_ID = "BUNKU1mDhD6GNnpHJRZAZpEj3nGoqVZZe8RvAdTaLyoz"
-TRACKED_PROGRAMS = [PUMP_PROGRAM_ID, BUNK_PROGRAM_ID]
-
 shutdown_event = asyncio.Event()
 
 def load_positions():
@@ -56,12 +52,14 @@ def load_positions():
     return {}
 
 def save_positions(positions):
-    with open(POSITION_FILE, "w") as f:
+    tmp_file = POSITION_FILE + ".tmp"
+    with open(tmp_file, "w") as f:
         json.dump(positions, f, indent=2)
+    os.replace(tmp_file, POSITION_FILE)
 
 async def process_tokens():
     positions = load_positions()
-    tokens = await get_recent_tokens_from_helius(TRACKED_PROGRAMS)
+    tokens = get_recent_tokens_from_dbotx()
     logger.info(f"[main] Fetched {len(tokens)} tokens")
 
     now = time.time()
@@ -89,7 +87,7 @@ async def process_tokens():
         metadata = await get_token_metadata(mint)
         logger.info(f"[buy] {mint} | {metadata.get('symbol')}")
 
-        await send_telegram_message(f"📥 Buying {metadata.get('symbol')} ({mint})")
+        await send_telegram_message(f"\U0001F4C5 Buying {metadata.get('symbol')} ({mint})")
 
         tx = await buy_token(mint, BUY_AMOUNT_SOL)
         if not tx.get("success"):
@@ -121,12 +119,12 @@ async def monitor_positions():
             logger.info(f"[track] {mint} | {data['symbol']} | x{change:.2f}")
 
             if change >= PROFIT_TARGET:
-                await send_telegram_message(f"📈 Profit target reached for {data['symbol']} ({mint}), selling...")
+                await send_telegram_message(f"\U0001F4C8 Profit target reached for {data['symbol']} ({mint}), selling...")
                 if await sell_token(mint):
                     del positions[mint]
                     save_positions(positions)
             elif change <= STOP_LOSS:
-                await send_telegram_message(f"📉 Stop-loss triggered for {data['symbol']} ({mint}), selling...")
+                await send_telegram_message(f"\U0001F4C9 Stop-loss triggered for {data['symbol']} ({mint}), selling...")
                 if await sell_token(mint):
                     del positions[mint]
                     save_positions(positions)
@@ -141,14 +139,31 @@ async def main_loop():
         await asyncio.sleep(10)
 
 async def main():
-    await asyncio.gather(main_loop(), monitor_positions())
+    tasks = [
+        asyncio.create_task(listen_to_dbotx_trades()),
+        asyncio.create_task(main_loop()),
+        asyncio.create_task(monitor_positions())
+    ]
+    await shutdown_event.wait()
+    logger.info("[shutdown] Cancelling tasks...")
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    logger.info("[shutdown] All tasks cancelled. Exiting.")
 
-def shutdown_handler(sig, frame):
-    logger.info(f"[shutdown] Signal received: {sig}")
+def shutdown_handler():
+    logger.info("[shutdown] Signal received, shutting down...")
     shutdown_event.set()
 
-signal.signal(signal.SIGINT, shutdown_handler)
-signal.signal(signal.SIGTERM, shutdown_handler)
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, shutdown_handler)
+        except NotImplementedError:
+            # Windows compatibility fallback
+            signal.signal(sig, lambda s, f: shutdown_handler())
+    try:
+        loop.run_until_complete(main())
+    finally:
+        loop.close()
