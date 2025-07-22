@@ -1,142 +1,97 @@
-import os
-import aiohttp
-import logging
-import time
 import asyncio
-from solders.pubkey import Pubkey
-from dotenv import load_dotenv
+import aiohttp
+import json
+import logging
+import os
+from typing import List, Dict, Optional
+from collections import deque
 
-load_dotenv()
+# === Configuration ===
+DBOTX_WS_URL = "wss://api-bot-v1.dbotx.com/trade/ws"
+DBOTX_API_KEY = os.getenv("DBOTX_API_KEY") or "YOUR_TEST_API_KEY"  # Replace with your real key or set env var
+MAX_TOKENS = 100  # Max tokens to keep in memory
+
+# === Logging Setup ===
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# === Config ===
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
-JUPITER_BASE_URL = "https://quote-api.jup.ag"
+# === Token Storage (thread-safe for asyncio) ===
+detected_tokens = deque(maxlen=MAX_TOKENS)
 
-# === Program IDs ===
-PUMP_FUN_PROGRAM = "6u6QbZvcj5JkGFsKfJQkRXiRwz9wrDxQ6Uijvqx6uXwp"
-BUNK_FUN_PROGRAM = "BUNKU1mDhD6GNnpHJRZAZpEj3nGoqVZZe8RvAdTaLyoz"
-PROGRAM_IDS = [PUMP_FUN_PROGRAM, BUNK_FUN_PROGRAM]
-
-# === Helper: Retry logic for network requests ===
-async def fetch_with_retries(session, url, headers=None, retries=3, delay=2):
-    for attempt in range(retries):
+async def listen_to_dbotx_trades(chain: str = "solana"):
+    """
+    Listen to DBotX WebSocket for trade events on the specified chain.
+    Automatically reconnects on failure.
+    """
+    headers = {"X-API-KEY": DBOTX_API_KEY}
+    backoff = 1
+    while True:
         try:
-            async with session.get(url, headers=headers) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                else:
-                    logger.warning(f"HTTP {resp.status} for {url}")
-                    raw = await resp.text()
-                    logger.warning(f"Raw response: {raw}")
-        except Exception as e:
-            logger.warning(f"Attempt {attempt+1} failed for {url}: {e}")
-        await asyncio.sleep(delay)
-    logger.warning(f"All {retries} attempts failed for {url}")
-    return None
+            async with aiohttp.ClientSession() as session:
+                async with session.ws_connect(DBOTX_WS_URL, headers=headers) as ws:
+                    logger.info(f"[ws] Connected to DBotX WebSocket (chain={chain})")
+                    subscribe_msg = {
+                        "event": "subscribe",
+                        "channel": "trades",
+                        "chain": chain
+                    }
+                    await ws.send_json(subscribe_msg)
+                    backoff = 1  # Reset backoff after successful connect
 
-# === Telegram ===
-async def send_telegram_message(message: str):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("Telegram credentials not set")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload) as resp:
-                if resp.status != 200:
-                    logger.warning(f"[telegram] failed: {resp.status}")
-    except Exception as e:
-        logger.warning(f"[telegram] error: {e}")
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            try:
+                                data = json.loads(msg.data)
+                                logger.debug(f"[ws] Received: {data}")
 
-# === Helius token fetch ===
-async def get_recent_tokens_from_helius(program_ids=PROGRAM_IDS, limit=10):
-    tokens = []
-    headers = {"Content-Type": "application/json"}
-    now = int(time.time())
-    async with aiohttp.ClientSession() as session:
-        for program_id in program_ids:
-            url = f"https://mainnet.helius.xyz/v0/addresses/{program_id}/transactions?api-key={HELIUS_API_KEY}&limit={limit}"
-            data = await fetch_with_retries(session, url, headers)
-            if not data:
-                continue
-            if not isinstance(data, list):
-                logger.warning(f"Unexpected data format (expected list): {data}")
-                continue
-            for tx in data:
-                try:
-                    mint = None
-                    for inst in tx.get("instructions", []):
-                        if "mint" in inst and isinstance(inst["mint"], str):
-                            mint = inst["mint"]
+                                # Example filtering logic
+                                if "token" in data:
+                                    token_info = {
+                                        "mint": data["token"],
+                                        "symbol": data.get("symbol", ""),
+                                        "amount": data.get("amount", 0),
+                                        "price": data.get("price", 0)
+                                    }
+                                    detected_tokens.append(token_info)
+                                    logger.info(f"[ws] New token detected: {token_info}")
+
+                            except json.JSONDecodeError:
+                                logger.warning(f"[ws] Invalid JSON: {msg.data}")
+                        elif msg.type == aiohttp.WSMsgType.ERROR:
+                            logger.error("[ws] WebSocket error: %s", msg.data)
                             break
-                    if not mint:
-                        continue
-                    tokens.append({
-                        "mint": mint,
-                        "timestamp": tx.get("timestamp", now)
-                    })
-                except Exception as e:
-                    logger.warning(f"Error parsing transaction: {e}")
-    return tokens
+        except asyncio.CancelledError:
+            logger.info("[ws] Listener cancelled, shutting down gracefully.")
+            break
+        except Exception as e:
+            logger.error(f"[ws] Connection error: {e}")
+            logger.info(f"[ws] Reconnecting in {backoff} seconds...")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)  # Exponential backoff, max 60s
 
-# === Liquidity check ===
-async def has_sufficient_liquidity(mint, min_liquidity_lamports):
-    url = f"{JUPITER_BASE_URL}/v6/pools?mint={mint}"
-    async with aiohttp.ClientSession() as session:
-        data = await fetch_with_retries(session, url)
-        if not data:
-            return False
-        for pool in data.get("pools", []):
-            if int(pool.get("lp_fee_bps", 0)) > 100:  # filter scammy pools
-                continue
-            base_liq = int(pool.get("base_liquidity", 0))
-            quote_liq = int(pool.get("quote_liquidity", 0))
-            if base_liq >= min_liquidity_lamports or quote_liq >= min_liquidity_lamports:
-                return True
-    return False
+def get_recent_tokens_from_dbotx(limit: int = 20) -> List[Dict]:
+    """
+    Return the most recent detected tokens, up to `limit`.
+    """
+    return list(detected_tokens)[-limit:] if detected_tokens else []
 
-# === Token metadata ===
-async def get_token_metadata(mint):
-    url = f"https://token.jup.ag/strict/{mint}"
-    async with aiohttp.ClientSession() as session:
-        data = await fetch_with_retries(session, url)
-        if data:
-            return data
-    return {"symbol": "Unknown"}
+# === Example Usage ===
+async def main():
+    # Start the listener as a background task
+    listener_task = asyncio.create_task(listen_to_dbotx_trades(chain="solana"))
 
-# === Buy ===
-async def buy_token(mint, amount_sol):
     try:
-        # Replace with actual buy logic
-        logger.info(f"[stub] Simulating buy of {amount_sol} SOL for {mint}")
-        return {"success": True, "txid": "dummy_txid"}
-    except Exception as e:
-        logger.warning(f"[buy] failed: {e}")
-        return {"success": False, "error": str(e)}
-
-# === Sell ===
-async def sell_token(mint, amount_token=None):
-    try:
-        # Replace with actual sell logic
-        logger.info(f"[stub] Simulating sell of {mint}")
-        return {"success": True, "txid": "dummy_txid"}
-    except Exception as e:
-        logger.warning(f"[sell] failed: {e}")
-        return {"success": False, "error": str(e)}
-
-# === Get token price ===
-async def get_token_price(mint):
-    url = f"https://price.jup.ag/v4/price?ids={mint}"
-    async with aiohttp.ClientSession() as session:
-        data = await fetch_with_retries(session, url)
-        if data:
-            price_data = data.get("data", {}).get(mint)
-            if price_data:
-                return price_data["price"]
+        while True:
+            await asyncio.sleep(10)
+            recent = get_recent_tokens_from_dbotx()
+            if recent:
+                logger.info(f"Recent tokens: {recent}")
             else:
-                logger.warning(f"[price] No price for {mint}")
-    return None
+                logger.info("No tokens detected yet.")
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+        listener_task.cancel()
+        await listener_task
+
+if __name__ == "__main__":
+    asyncio.run(main())
