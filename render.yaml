@@ -15,9 +15,13 @@ services:
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
-      - key: HELIUS_API_KEY
-        sync: false
       - key: RPC_URL
         sync: false
       - key: PRIVATE_KEY
         sync: false
+      - key: BUY_AMOUNT_SOL
+        value: "0.05"
+      - key: PROFIT_TARGET
+        value: "2.0"
+      - key: STOP_LOSS
+        value: "0.5"
