@@ -33,25 +33,28 @@ async def get_recent_tokens_from_dbotx():
         logger.error(f"[get_recent_tokens] error: {e}")
     return []
 
-# --- Token metadata (stub) ---
+# --- Token metadata ---
 async def get_token_metadata(mint: str):
-    # You can later integrate metadata fetching
+    # Simulate token metadata lookup (can integrate real metadata fetch later)
     return {
-        "symbol": mint[:4].upper()
+        "symbol": mint[:4].upper(),
+        "name": f"Token {mint[:6]}"
     }
 
-# --- Buy token (stub) ---
+# --- Simulated Buy ---
 async def buy_token(mint: str, amount_sol: float):
     logger.info(f"[buy] Simulating buy of {amount_sol} SOL for {mint}")
     await asyncio.sleep(1)
     return {"success": True, "tx": "SIMULATED_TX_HASH"}
 
-# --- Get token price (stub) ---
+# --- Simulated Price (pseudo-random for testing) ---
 async def get_token_price(mint: str):
-    await asyncio.sleep(1)
-    return float(1.0)
+    await asyncio.sleep(0.5)
+    # Simulate price as random multiple between 0.4x to 2.5x
+    import random
+    return float(round(random.uniform(0.4, 2.5), 4))
 
-# --- Sell token (stub) ---
+# --- Simulated Sell ---
 async def sell_token(mint: str):
     logger.info(f"[sell] Simulating sell for {mint}")
     await asyncio.sleep(1)
@@ -77,7 +80,7 @@ async def send_telegram_message(message: str):
 
 # --- Listen to DBotX trades (WebSocket) ---
 async def listen_to_dbotx_trades():
-    url = "wss://api-bot-v1.dbotx.com/trade/ws"  # No trailing slash!
+    url = "wss://api-bot-v1.dbotx.com/trade/ws"
     headers = {"X-API-KEY": DBOTX_API_KEY}
     while True:
         try:
@@ -89,9 +92,9 @@ async def listen_to_dbotx_trades():
                             logger.info(f"[ws] Message: {msg.data}")
         except Exception as e:
             logger.error(f"[ws] Connection error: {e}")
-            await asyncio.sleep(1)
+            await asyncio.sleep(3)
 
-# --- Sufficient liquidity (stub, always True) ---
+# --- Placeholder liquidity checker ---
 async def has_sufficient_liquidity(token_address: str, min_liquidity_lamports: int) -> bool:
-    # Placeholder that always returns True (since DBotX already filters tokens)
+    # DBotX filters already; always return True here
     return True
