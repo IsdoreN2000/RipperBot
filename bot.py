@@ -59,7 +59,7 @@ def save_positions(positions):
 
 async def process_tokens():
     positions = load_positions()
-    tokens = get_recent_tokens_from_dbotx()
+    tokens = await get_recent_tokens_from_dbotx()
     logger.info(f"[main] Fetched {len(tokens)} tokens")
 
     now = time.time()
@@ -156,12 +156,12 @@ def shutdown_handler():
     shutdown_event.set()
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, shutdown_handler)
         except NotImplementedError:
-            # Windows compatibility fallback
             signal.signal(sig, lambda s, f: shutdown_handler())
     try:
         loop.run_until_complete(main())
