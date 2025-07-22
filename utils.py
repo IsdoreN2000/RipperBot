@@ -1,94 +1,97 @@
-import asyncio
-import aiohttp
-import json
-import logging
 import os
-import signal
-from typing import List, Dict
-from collections import deque
+import aiohttp
+import asyncio
+import logging
+from decimal import Decimal
 from dotenv import load_dotenv
 
-# === Load environment variables early ===
 load_dotenv()
+logger = logging.getLogger(__name__)
 
-# === Configuration ===
-DBOTX_WS_URL = "wss://api-bot-v1.dbotx.com/trade/ws"
 DBOTX_API_KEY = os.getenv("DBOTX_API_KEY")
 if not DBOTX_API_KEY:
     raise ValueError("Missing DBOTX_API_KEY in environment variables.")
-MAX_TOKENS = 100
 
-# === Logging Setup ===
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-detected_tokens = deque(maxlen=MAX_TOKENS)
+# --- Async: Get recent tokens from DBotX ---
+async def get_recent_tokens_from_dbotx():
+    headers = {
+        "X-API-KEY": DBOTX_API_KEY
+    }
+    url = "https://api-bot-v1.dbotx.com/trade/tokens"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get("tokens", [])
+                else:
+                    logger.error(f"[get_recent_tokens] HTTP {resp.status}: {await resp.text()}")
+    except Exception as e:
+        logger.error(f"[get_recent_tokens] error: {e}")
+    return []
 
-async def listen_to_dbotx_trades(chain: str = "solana"):
+# --- Token metadata (stub) ---
+async def get_token_metadata(mint: str):
+    # You can later integrate metadata fetching
+    return {
+        "symbol": mint[:4].upper()
+    }
+
+# --- Buy token (stub) ---
+async def buy_token(mint: str, amount_sol: float):
+    logger.info(f"[buy] Simulating buy of {amount_sol} SOL for {mint}")
+    await asyncio.sleep(1)
+    return {"success": True, "tx": "SIMULATED_TX_HASH"}
+
+# --- Get token price (stub) ---
+async def get_token_price(mint: str):
+    await asyncio.sleep(1)
+    return float(1.0)
+
+# --- Sell token (stub) ---
+async def sell_token(mint: str):
+    logger.info(f"[sell] Simulating sell for {mint}")
+    await asyncio.sleep(1)
+    return True
+
+# --- Telegram notification ---
+async def send_telegram_message(message: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.warning("[telegram] Missing credentials.")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload) as resp:
+                if resp.status != 200:
+                    logger.warning(f"[telegram] Failed to send message: {await resp.text()}")
+    except Exception as e:
+        logger.error(f"[telegram] Error sending message: {e}")
+
+# --- Listen to DBotX trades (WebSocket) ---
+async def listen_to_dbotx_trades():
+    url = "wss://api-bot-v1.dbotx.com/trade/ws"  # No trailing slash!
     headers = {"X-API-KEY": DBOTX_API_KEY}
-    backoff = 1
     while True:
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.ws_connect(DBOTX_WS_URL, headers=headers) as ws:
-                    logger.info(f"[ws] Connected to DBotX WebSocket (chain={chain})")
-                    subscribe_msg = {
-                        "event": "subscribe",
-                        "channel": "trades",
-                        "chain": chain
-                    }
-                    await ws.send_json(subscribe_msg)
-                    backoff = 1
+                async with session.ws_connect(url, headers=headers) as ws:
+                    logger.info("[ws] Connected to DBotX WebSocket.")
                     async for msg in ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
-                            try:
-                                data = json.loads(msg.data)
-                                logger.debug(f"[ws] Received: {data}")
-                                if "token" in data:
-                                    token_info = {
-                                        "mint": data["token"],
-                                        "symbol": data.get("symbol", ""),
-                                        "amount": data.get("amount", 0),
-                                        "price": data.get("price", 0)
-                                    }
-                                    detected_tokens.append(token_info)
-                                    logger.info(f"[ws] New token detected: {token_info}")
-                            except json.JSONDecodeError:
-                                logger.warning(f"[ws] Invalid JSON: {msg.data}")
-                        elif msg.type == aiohttp.WSMsgType.ERROR:
-                            logger.error("[ws] WebSocket error: %s", msg.data)
-                            break
-        except asyncio.CancelledError:
-            logger.info("[ws] Listener cancelled, shutting down gracefully.")
-            break
+                            logger.info(f"[ws] Message: {msg.data}")
         except Exception as e:
             logger.error(f"[ws] Connection error: {e}")
-            logger.info(f"[ws] Reconnecting in {backoff} seconds...")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60)
+            await asyncio.sleep(1)
 
-def get_recent_tokens_from_dbotx(limit: int = 20) -> List[Dict]:
-    return list(detected_tokens)[-limit:] if detected_tokens else []
-
-async def main():
-    listener_task = asyncio.create_task(listen_to_dbotx_trades(chain="solana"))
-    try:
-        while True:
-            await asyncio.sleep(10)
-            recent = get_recent_tokens_from_dbotx()
-            if recent:
-                logger.info(f"Recent tokens: {recent}")
-            else:
-                logger.info("No tokens detected yet.")
-    except KeyboardInterrupt:
-        logger.info("Shutting down...")
-        listener_task.cancel()
-        await listener_task
-
-def shutdown():
-    logger.info("Received shutdown signal.")
-    raise KeyboardInterrupt
-
-if __name__ == "__main__":
-    signal.signal(signal.SIGTERM, lambda s, f: shutdown())
-    asyncio.run(main())
+# --- Sufficient liquidity (stub, always True) ---
+async def has_sufficient_liquidity(token_address: str, min_liquidity_lamports: int) -> bool:
+    # Placeholder that always returns True (since DBotX already filters tokens)
+    return True
