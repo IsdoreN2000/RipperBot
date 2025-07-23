@@ -1,201 +1,163 @@
-import aiohttp
-import asyncio
-import logging
 import os
 import time
+import json
+import logging
+import aiohttp
 from decimal import Decimal
-from typing import Any, Dict, List, Optional
 
-# --- Constants ---
-DBOTX_DATA_API = "https://api-data-v1.dbotx.com"
-DBOTX_SIMULATOR_API = "https://api-bot-v1.dbotx.com/simulator/snipe_order"
-JUP_QUOTE_API = "https://quote-api.jup.ag/v6/quote"
-DEXSCREENER_API = "https://api.dexscreener.com/latest/dex/pairs/solana"
-JUP_PRICE_API = "https://price.jup.ag/v4/price"
+from dotenv import load_dotenv
 
+load_dotenv()
+
+DBOTX_API_KEY = os.getenv("DBOTX_API_KEY")
+JUPITER_SWAP_API = "https://quote-api.jup.ag/v6/quote"
+SOL_DECIMALS = 1_000_000_000
 MIN_HOLDERS = 10
-MAX_TOP10_PERCENT = 30
+MAX_TOP_HOLDER_PERCENT = 30
 MIN_MARKET_CAP = 1000
 MIN_VOLUME = 1000
-MIN_TOKEN_AGE_SECONDS = 0
-MAX_TOKEN_AGE_SECONDS = 360
-MAX_PRICE_IMPACT = 0.5
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("utils")
 
-# --- Helper Functions ---
+headers = {
+    "Authorization": f"Bearer {DBOTX_API_KEY}"
+}
 
-async def get_json(session: aiohttp.ClientSession, url: str) -> Optional[Dict[str, Any]]:
+async def get_json(session, url):
     try:
-        async with session.get(url) as resp:
+        async with session.get(url, headers=headers) as resp:
+            if resp.status == 403:
+                body = await resp.text()
+                logger.error(f"[get_json] HTTP 403: {body} (URL: {url})")
+                return None
             if resp.status != 200:
-                logger.error(f"[get_json] HTTP {resp.status}: {await resp.text()} (URL: {url})")
+                logger.warning(f"[get_json] HTTP {resp.status}: {url}")
                 return None
             return await resp.json()
-    except aiohttp.ClientError as e:
-        logger.error(f"[get_json] Client error fetching {url}: {e}")
     except Exception as e:
-        logger.error(f"[get_json] Unexpected error fetching {url}: {e}")
-    return None
+        logger.error(f"[get_json] error: {e}")
+        return None
 
-# --- Main Logic Functions ---
-
-async def get_recent_tokens_from_dbotx(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
-    url = f"{DBOTX_DATA_API}/kline/new?chain=solana&sortBy=createdAt&sort=desc&interval=1m"
+async def get_recent_tokens_from_dbotx(session):
+    url = "https://api-data-v1.dbotx.com/kline/new?chain=solana&sortBy=createdAt&sort=desc&interval=1m"
     data = await get_json(session, url)
-    if not data or "data" not in data:
+    if not data or not isinstance(data, list):
         return []
 
-    tokens = []
-    for item in data["data"]:
-        try:
-            mint = item.get("baseMint")
-            if not mint:
-                continue
+    filtered_tokens = []
+    now = time.time()
 
-            created_at = item.get("createdAt")
-            if not created_at:
-                continue
-            timestamp = created_at / 1000
-            age = time.time() - timestamp
-            # --- Updated age filter ---
-            if not (MIN_TOKEN_AGE_SECONDS <= age <= MAX_TOKEN_AGE_SECONDS):
-                continue
+    for token in data:
+        mint = token.get("baseMint")
+        timestamp = token.get("createdAt")
+        liquidity = token.get("liquidity", 0)
+        holders = token.get("holders", [])
+        market_cap = token.get("marketCap", 0)
+        volume = token.get("volume24h", 0)
 
-            token_info = await get_token_info(session, mint)
-            if not token_info:
-                continue
-
-            if (
-                token_info["holder_count"] < MIN_HOLDERS or
-                token_info["top_holders_percent"] > MAX_TOP10_PERCENT or
-                token_info["market_cap"] < MIN_MARKET_CAP or
-                token_info["volume_24h"] < MIN_VOLUME
-            ):
-                continue
-
-            tokens.append({
-                "mint": mint,
-                "timestamp": timestamp,
-                "symbol": token_info["symbol"],
-                "name": token_info["name"]
-            })
-        except Exception as e:
-            logger.warning(f"[parse token] Error: {e} (item: {item})")
+        if not mint or not timestamp:
             continue
 
-    return tokens
+        age = now - (timestamp / 1000)
+        if age < 0 or age > 360:
+            continue
+        if liquidity < 20 * SOL_DECIMALS:
+            continue
+        if len(holders) < MIN_HOLDERS:
+            continue
 
-async def get_token_info(session: aiohttp.ClientSession, mint: str) -> Optional[Dict[str, Any]]:
-    url = f"{DBOTX_DATA_API}/token/info?chain=solana&address={mint}"
-    data = await get_json(session, url)
-    if not data or "data" not in data:
-        return None
-    info = data["data"]
-    return {
-        "holder_count": info.get("holders", 0),
-        "top_holders_percent": info.get("top10HoldersPercent", 100),
-        "market_cap": info.get("marketCap", 0),
-        "volume_24h": info.get("volume24h", 0),
-        "symbol": info.get("symbol", ""),
-        "name": info.get("name", "")
-    }
+        total_supply = sum([h.get("balance", 0) for h in holders])
+        top_10 = sorted(holders, key=lambda h: h.get("balance", 0), reverse=True)[:10]
+        top_10_total = sum([h.get("balance", 0) for h in top_10])
+        top_10_percent = (top_10_total / total_supply) * 100 if total_supply else 100
 
-async def has_sufficient_liquidity(session: aiohttp.ClientSession, mint: str, min_liquidity: int) -> bool:
-    url = f"{JUP_QUOTE_API}?inputMint={mint}&outputMint=So11111111111111111111111111111111111111112&amount=1000000"
-    data = await get_json(session, url)
-    if not data or "routes" not in data or not data["routes"]:
-        return False
-    route = data["routes"][0]
-    in_amount = int(route.get("inAmount", 0))
-    out_amount = int(route.get("outAmount", 0))
-    price_impact = float(route.get("priceImpactPct", 1))
-    return in_amount > 0 and out_amount > 0 and price_impact < MAX_PRICE_IMPACT
+        if top_10_percent > MAX_TOP_HOLDER_PERCENT:
+            continue
+        if market_cap < MIN_MARKET_CAP:
+            continue
+        if volume < MIN_VOLUME:
+            continue
 
-async def get_token_metadata(session: aiohttp.ClientSession, mint: str) -> Dict[str, str]:
-    url = f"{DEXSCREENER_API}/{mint}"
-    data = await get_json(session, url)
+        filtered_tokens.append({
+            "mint": mint,
+            "timestamp": timestamp / 1000,
+            "symbol": token.get("baseSymbol"),
+        })
+
+    return filtered_tokens
+
+async def has_sufficient_liquidity(mint, min_liquidity_lamports):
+    url = f"{JUPITER_SWAP_API}?inputMint=So11111111111111111111111111111111111111112&outputMint={mint}&amount=10000000"
+    async with aiohttp.ClientSession() as session:
+        data = await get_json(session, url)
     if not data:
-        return {"symbol": "UNKNOWN", "name": ""}
-    return {
-        "symbol": data.get("pair", {}).get("baseToken", {}).get("symbol", "UNKNOWN"),
-        "name": data.get("pair", {}).get("baseToken", {}).get("name", "")
-    }
-
-async def get_token_price(session: aiohttp.ClientSession, mint: str) -> Optional[float]:
-    url = f"{JUP_PRICE_API}?ids={mint}"
-    data = await get_json(session, url)
-    if not data:
-        return None
-    price = data.get("data", {}).get(mint, {}).get("price")
-    return float(price) if price else None
-
-async def buy_token(session: aiohttp.ClientSession, mint: str, amount_sol: float) -> Dict[str, Any]:
-    payload = {
-        "chain": "solana",
-        "mint": mint,
-        "amount": amount_sol,
-        "action": "buy"
-    }
-    try:
-        async with session.post(DBOTX_SIMULATOR_API, json=payload) as resp:
-            if resp.status != 200:
-                return {"success": False, "error": await resp.text()}
-            return {"success": True, "tx": await resp.text()}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-async def sell_token(session: aiohttp.ClientSession, mint: str) -> bool:
-    payload = {
-        "chain": "solana",
-        "mint": mint,
-        "action": "sell"
-    }
-    try:
-        async with session.post(DBOTX_SIMULATOR_API, json=payload) as resp:
-            return resp.status == 200
-    except Exception as e:
-        logger.warning(f"[sell_token] Error: {e}")
         return False
 
-async def send_telegram_message(session: aiohttp.ClientSession, msg: str) -> None:
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    routes = data.get("data", [])
+    if not routes:
+        return False
+
+    best = routes[0]
+    out_amt = int(best.get("outAmount", 0))
+    return out_amt > 0
+
+async def get_token_metadata(mint):
+    # Simulate token metadata fetch (replace with real logic if needed)
+    return {
+        "symbol": f"TKN",
+        "name": f"Token {mint[:4]}"
+    }
+
+async def buy_token(mint, amount_sol):
+    # Simulate buy logic
+    logger.info(f"[buy_token] Buying {mint} with {amount_sol} SOL")
+    return {"success": True, "tx": "mock_tx_id"}
+
+async def get_token_price(mint):
+    # Simulate price lookup (replace with real price source)
+    return round(Decimal("0.0001") * (time.time() % 100), 6)
+
+async def sell_token(mint):
+    # Simulate sell logic
+    logger.info(f"[sell_token] Selling {mint}")
+    return True
+
+async def send_telegram_message(text):
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        logger.warning("[telegram] Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
+    if not bot_token or not chat_id:
+        logger.warning("[telegram] Missing credentials")
         return
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    data = {"chat_id": chat_id, "text": text}
     try:
-        async with session.post(url, json={"chat_id": chat_id, "text": msg}) as resp:
-            if resp.status != 200:
-                logger.warning(f"[telegram] Failed to send message: {await resp.text()}")
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, data=data) as resp:
+                if resp.status != 200:
+                    logger.warning(f"[telegram] Failed to send: {resp.status}")
     except Exception as e:
-        logger.warning(f"[telegram] Exception sending message: {e}")
+        logger.warning(f"[telegram] Error: {e}")
 
 async def listen_to_dbotx_trades():
-    url = "wss://api-bot-v1.dbotx.com/trade/ws/"
-    while True:
+    import websockets
+    import asyncio
+
+    ws_url = "wss://api-bot-v1.dbotx.com/trade/ws/"
+
+    async def listen():
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.ws_connect(url) as ws:
-                    logger.info("[ws] Connected to DBotX WebSocket.")
-                    async for msg in ws:
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            logger.debug(f"[ws] Message: {msg.data}")
+            async with websockets.connect(ws_url, extra_headers=headers) as ws:
+                logger.info("[ws] Connected to DBotX WebSocket.")
+                while True:
+                    try:
+                        msg = await ws.recv()
+                        logger.debug(f"[ws] Received: {msg}")
+                    except Exception as e:
+                        logger.warning(f"[ws] Error: {e}")
+                        break
         except Exception as e:
             logger.error(f"[ws] Connection error: {e}")
-            await asyncio.sleep(5)
 
-# --- Example Main Entrypoint ---
-
-async def main():
-    async with aiohttp.ClientSession() as session:
-        tokens = await get_recent_tokens_from_dbotx(session)
-        logger.info(f"Found {len(tokens)} recent tokens (age 0-360s).")
-        # Example: send a Telegram message for each token
-        for token in tokens:
-            await send_telegram_message(session, f"New token: {token['symbol']} ({token['mint']})")
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    asyncio.run(main())
+    while True:
+        await listen()
+        await asyncio.sleep(5)
