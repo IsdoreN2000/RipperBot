@@ -36,7 +36,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 MIN_TOKEN_AGE_SECONDS = 60
-MAX_TOKEN_AGE_SECONDS = 3600
+MAX_TOKEN_AGE_SECONDS = 360
 MIN_LIQUIDITY_LAMPORTS = int(os.getenv("MIN_LIQUIDITY_LAMPORTS", 20 * 1_000_000_000))  # 20 SOL
 BUY_AMOUNT_SOL = float(os.getenv("BUY_AMOUNT_SOL", 0.05))
 PROFIT_TARGET = float(os.getenv("PROFIT_TARGET", 2.0))  # 2x
@@ -59,52 +59,54 @@ def save_positions(positions):
 
 async def process_tokens():
     positions = load_positions()
-    tokens = await get_recent_tokens_from_dbotx()
-    logger.info(f"[main] Fetched {len(tokens)} tokens")
+    async with aiohttp.ClientSession() as session:
+        tokens = await get_recent_tokens_from_dbotx(session)
 
-    now = time.time()
-    for token in tokens:
-        mint = token["mint"]
-        timestamp = token.get("timestamp", now)
-        age = now - timestamp
+        logger.info(f"[main] Fetched {len(tokens)} tokens")
 
-        logger.info(f"[check] {mint} age: {int(age)}s")
+        now = time.time()
+        for token in tokens:
+            mint = token["mint"]
+            timestamp = token.get("timestamp", now)
+            age = now - timestamp
 
-        if mint in positions:
-            logger.info(f"[skip] {mint} already bought")
-            continue
-        if age < MIN_TOKEN_AGE_SECONDS:
-            logger.info(f"[skip] {mint} too new ({int(age)}s)")
-            continue
-        if age > MAX_TOKEN_AGE_SECONDS:
-            logger.info(f"[skip] {mint} too old ({int(age)}s)")
-            continue
+            logger.info(f"[check] {mint} age: {int(age)}s")
 
-        if not await has_sufficient_liquidity(mint, MIN_LIQUIDITY_LAMPORTS):
-            logger.info(f"[skip] {mint} insufficient liquidity")
-            continue
+            if mint in positions:
+                logger.info(f"[skip] {mint} already bought")
+                continue
+            if age < MIN_TOKEN_AGE_SECONDS:
+                logger.info(f"[skip] {mint} too new ({int(age)}s)")
+                continue
+            if age > MAX_TOKEN_AGE_SECONDS:
+                logger.info(f"[skip] {mint} too old ({int(age)}s)")
+                continue
 
-        metadata = await get_token_metadata(mint)
-        logger.info(f"[buy] {mint} | {metadata.get('symbol')}")
+            if not await has_sufficient_liquidity(mint, MIN_LIQUIDITY_LAMPORTS):
+                logger.info(f"[skip] {mint} insufficient liquidity")
+                continue
 
-        await send_telegram_message(f"\U0001F4C5 Buying {metadata.get('symbol')} ({mint})")
+            metadata = await get_token_metadata(mint)
+            logger.info(f"[buy] {mint} | {metadata.get('symbol')}")
 
-        tx = await buy_token(mint, BUY_AMOUNT_SOL)
-        if not tx.get("success"):
-            logger.warning(f"[fail] buy failed: {tx.get('error')}")
-            continue
+            await send_telegram_message(f"\U0001F4C5 Buying {metadata.get('symbol')} ({mint})")
 
-        price = await get_token_price(mint)
-        if price is None:
-            logger.warning(f"[fail] price fetch failed after buy")
-            continue
+            tx = await buy_token(mint, BUY_AMOUNT_SOL)
+            if not tx.get("success"):
+                logger.warning(f"[fail] buy failed: {tx.get('error')}")
+                continue
 
-        positions[mint] = {
-            "symbol": metadata.get("symbol"),
-            "buy_price": price,
-            "timestamp": time.time()
-        }
-        save_positions(positions)
+            price = await get_token_price(mint)
+            if price is None:
+                logger.warning(f"[fail] price fetch failed after buy")
+                continue
+
+            positions[mint] = {
+                "symbol": metadata.get("symbol"),
+                "buy_price": price,
+                "timestamp": time.time()
+            }
+            save_positions(positions)
 
 async def monitor_positions():
     while not shutdown_event.is_set():
