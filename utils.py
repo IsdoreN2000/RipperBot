@@ -14,18 +14,21 @@ DBOTX_API_KEY = os.getenv("DBOTX_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+if not DBOTX_API_KEY:
+    raise RuntimeError("Missing DBOTX_API_KEY in .env")
+
 DBOTX_BASE_URL = "https://api-data-v1.dbotx.com"
 DBOTX_TRADE_URL = "https://api-bot-v1.dbotx.com"
 DBOTX_WS_URL = "wss://api-bot-v1.dbotx.com/trade/ws/"
 
 HEADERS = {
-    "Authorization": f"Bearer {DBOTX_API_KEY}"
+    "x-api-key": DBOTX_API_KEY
 }
 
 
 async def get_json(session, url):
     try:
-        async with session.get(url) as resp:
+        async with session.get(url, headers=HEADERS) as resp:
             if resp.status == 200:
                 return await resp.json()
             else:
