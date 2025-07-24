@@ -3,7 +3,6 @@ import asyncio
 import logging
 import os
 import json
-
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -11,21 +10,22 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("utils")
 
-DBOTX_BASE_URL = "https://api-data-v1.dbotx.com"
-DBOTX_TRADE_URL = "https://api-bot-v1.dbotx.com"
-DBOTX_WS_URL = "wss://api-bot-v1.dbotx.com/trade/ws/"
-
 DBOTX_API_KEY = os.getenv("DBOTX_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+DBOTX_BASE_URL = "https://api-data-v1.dbotx.com"
+DBOTX_TRADE_URL = "https://api-bot-v1.dbotx.com"
+DBOTX_WS_URL = "wss://api-bot-v1.dbotx.com/trade/ws/"
+
+HEADERS = {
+    "Authorization": f"Bearer {DBOTX_API_KEY}"
+}
+
 
 async def get_json(session, url):
     try:
-        headers = {
-            "Authorization": f"Bearer {DBOTX_API_KEY}"
-        } if DBOTX_API_KEY else {}
-        async with session.get(url, headers=headers) as resp:
+        async with session.get(url) as resp:
             if resp.status == 200:
                 return await resp.json()
             else:
@@ -63,13 +63,13 @@ async def has_sufficient_liquidity(mint, min_liquidity_lamports):
 
 async def get_token_metadata(token_address: str) -> dict:
     url = f"{DBOTX_BASE_URL}/token/metadata?chain=solana&tokenAddress={token_address}"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers={"Authorization": f"Bearer {DBOTX_API_KEY}"} if DBOTX_API_KEY else {}) as resp:
+    async with aiohttp.ClientSession(headers=HEADERS) as session:
+        async with session.get(url) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 return data.get("data", {})
             else:
-                logging.warning(f"[meta] Failed to fetch metadata for {token_address}: {resp.status}")
+                logger.warning(f"[meta] Failed to fetch metadata for {token_address}: {resp.status}")
                 return {}
 
 
@@ -114,11 +114,8 @@ async def send_telegram_message(msg):
 
 async def listen_to_dbotx_trades():
     try:
-        headers = {
-            "Authorization": f"Bearer {DBOTX_API_KEY}"
-        } if DBOTX_API_KEY else {}
-        async with aiohttp.ClientSession(headers=headers) as session:
-            async with session.ws_connect(DBOTX_WS_URL, headers=headers) as ws:
+        async with aiohttp.ClientSession(headers=HEADERS) as session:
+            async with session.ws_connect(DBOTX_WS_URL, headers=HEADERS) as ws:
                 logger.info("[ws] Connected to DBotX trade websocket")
                 async for msg in ws:
                     if msg.type == aiohttp.WSMsgType.TEXT:
