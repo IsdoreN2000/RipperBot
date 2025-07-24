@@ -30,6 +30,8 @@ POSITIONS_FILE = "positions.json"
 
 logger = logging.getLogger("utils")
 
+JUPITER_SWAP_API = "https://quote-api.jup.ag/v6/swap"
+
 async def send_telegram_message(message: str):
     if not TELEGRAM_ENABLED:
         return
@@ -133,3 +135,25 @@ async def listen_to_dbotx_trades():
                 logger.info(f"[ws] Message: {msg}")
     except Exception as e:
         logger.error(f"[ws] Connection error: {e}")
+
+# ✅ Add missing function
+async def has_sufficient_liquidity(mint, min_liquidity_lamports):
+    """
+    Check if the token has sufficient output liquidity via Jupiter.
+    Uses 0.01 SOL (10_000_000 lamports) to simulate a swap.
+    """
+    url = f"{JUPITER_SWAP_API}?inputMint=So11111111111111111111111111111111111111112&outputMint={mint}&amount=10000000"
+
+    async with aiohttp.ClientSession() as session:
+        data = await get_json(session, url)
+        if not data or "data" not in data:
+            return False
+
+        routes = data.get("data", [])
+        if not routes:
+            return False
+
+        # Check best route's output value
+        best_route = routes[0]
+        out_amount = int(best_route.get("outAmount", 0))
+        return out_amount >= min_liquidity_lamports
