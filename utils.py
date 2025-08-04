@@ -66,8 +66,8 @@ async def has_sufficient_liquidity(mint, min_liquidity_lamports):
 
 async def get_token_metadata(token_address: str) -> dict:
     url = f"{DBOTX_BASE_URL}/token/metadata?chain=solana&tokenAddress={token_address}"
-    async with aiohttp.ClientSession(headers=HEADERS) as session:
-        async with session.get(url) as resp:
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=HEADERS) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 return data.get("data", {})
@@ -117,7 +117,7 @@ async def send_telegram_message(msg):
 
 async def listen_to_dbotx_trades():
     try:
-        async with aiohttp.ClientSession(headers=HEADERS) as session:
+        async with aiohttp.ClientSession() as session:
             async with session.ws_connect(DBOTX_WS_URL, headers=HEADERS) as ws:
                 logger.info("[ws] Connected to DBotX trade websocket")
                 async for msg in ws:
